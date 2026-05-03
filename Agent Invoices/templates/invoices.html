@@ -1,0 +1,459 @@
+{% extends "base.html" %}
+{% block title %}Fatture - Invoice Agent{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-800">Fatture analizzate</h1>
+    <p class="text-sm text-gray-500">
+      {% if run_id %}Run #{{ run_id }} - {% endif %}
+      {{ invoices|length }} risultati
+    </p>
+  </div>
+  {% if run_id %}
+  <div class="flex gap-2 flex-wrap">
+    <a href="/api/export/{{ run_id }}/all"
+       class="text-sm bg-white border border-gray-300 hover:bg-gray-50 px-4 py-2 rounded-lg">
+      Esporta tutti CSV
+    </a>
+    {% if filters.get('class') %}
+    <a href="/api/export/{{ run_id }}/{{ filters['class'] }}"
+       class="text-sm bg-odoo-main hover:bg-odoo-dark text-white px-4 py-2 rounded-lg">
+      Esporta filtrati
+    </a>
+    {% endif %}
+    {% if filters.get('class') == 'MAPPATURA_FORNITORE_FISSO' %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'mapping')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'mapping')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze note di credito (TD04)
+    </button>
+    {% endif %}
+    {% if filters.get('class') == 'AUTO_VALIDABILE' %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', 'AUTO_VALIDABILE')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'oda', 'AUTO_VALIDABILE')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze note di credito (TD04)
+    </button>
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('AUTO_VALIDABILE')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification=AUTO_VALIDABILE" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+    {% if filters.get('class') == 'MATCH_IMPLICITO' %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', 'MATCH_IMPLICITO')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'oda', 'MATCH_IMPLICITO')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze note di credito (TD04)
+    </button>
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('MATCH_IMPLICITO')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification=MATCH_IMPLICITO" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+    {% if filters.get('class') == 'MATCH_DA_SUGGERIMENTO' %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', 'MATCH_DA_SUGGERIMENTO')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'oda', 'MATCH_DA_SUGGERIMENTO')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze note di credito (TD04)
+    </button>
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('MATCH_DA_SUGGERIMENTO')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification=MATCH_DA_SUGGERIMENTO" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+    {% if filters.get('class') == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA' %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01) + spese accessorie
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'oda', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze NC (TD04) + spese accessorie
+    </button>
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('MATCH_DA_SUGGERIMENTO_PIU_EXTRA')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification=MATCH_DA_SUGGERIMENTO_PIU_EXTRA" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+    {% if filters.get('class') in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
+                                    'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('{{ filters.get('class') }}')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification={{ filters.get('class') }}" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+    {% if filters.get('class') and run_id %}
+    <button id="btn-bulk-rollback" onclick="bulkRollback('{{ filters.get('class') }}')"
+            class="text-sm bg-rose-700 hover:bg-rose-800 text-white px-4 py-2 rounded-lg">
+      Rollback bulk
+    </button>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<!-- Filtri -->
+<form method="get" class="bg-white rounded-lg shadow p-4 mb-4">
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">Categoria</label>
+      <select name="class" class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm">
+        <option value="">Tutte</option>
+        {% for c in classifications %}
+          <option value="{{ c }}" {% if filters.get('class') == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">Fornitore</label>
+      <input type="text" name="supplier" value="{{ filters.get('supplier', '') }}"
+             placeholder="Nome fornitore..."
+             class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm">
+    </div>
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">Importo minimo</label>
+      <input type="number" name="min_amount" value="{{ filters.get('min_amount', '') }}"
+             step="any"
+             class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm">
+    </div>
+    <div class="flex items-end gap-2">
+      <button class="bg-odoo-main hover:bg-odoo-dark text-white px-4 py-1.5 rounded text-sm">Filtra</button>
+      <a href="/invoices{% if run_id %}/{{ run_id }}{% endif %}"
+         class="border border-gray-300 px-3 py-1.5 rounded text-sm hover:bg-gray-50">Pulisci</a>
+    </div>
+  </div>
+</form>
+
+<!-- Tabella -->
+<div class="bg-white rounded-lg shadow overflow-hidden">
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="bg-gray-50">
+        <tr>
+          <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Fornitore</th>
+          <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Fattura</th>
+          <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Data</th>
+          <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Importo</th>
+          <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">OdA</th>
+          <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Categoria</th>
+          <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Diff</th>
+          <th class="text-center px-3 py-2 text-xs font-semibold text-gray-600 uppercase"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        {% for inv in invoices %}
+        <tr class="hover:bg-gray-50">
+          <td class="px-3 py-2">
+            <div class="font-medium">{{ inv['supplier_name'] or 'N/D' }}</div>
+            <div class="text-xs text-gray-400">{{ inv['supplier_vat'] }}</div>
+          </td>
+          <td class="px-3 py-2">{{ inv['invoice_number'] or '-' }}</td>
+          <td class="px-3 py-2">{{ inv['invoice_date'] or '-' }}</td>
+          <td class="px-3 py-2 text-right font-mono">€{{ "{:,.2f}".format(inv['invoice_total'] or 0) }}</td>
+          <td class="px-3 py-2">
+            {% if inv['oda_odoo'] %}
+              <span class="font-mono text-odoo-700">{{ inv['oda_odoo'] }}</span>
+            {% elif inv['oda_xml'] %}
+              <span class="font-mono text-gray-400">{{ inv['oda_xml'] }}</span>
+            {% else %}-{% endif %}
+          </td>
+          <td class="px-3 py-2">
+            {% set cls = inv['classification'] %}
+            {% if cls == 'AUTO_VALIDABILE' %}
+              <span class="badge badge-green">AUTO_VALIDABILE</span>
+            {% elif cls == 'MATCH_IMPLICITO' %}
+              <span class="badge badge-green">MATCH_IMPLICITO</span>
+            {% elif cls == 'MATCH_DA_SUGGERIMENTO' %}
+              <span class="badge badge-amber">DA_SUGGERIMENTO &#9888;</span>
+            {% elif cls == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA' %}
+              <span class="badge badge-amber">DA_SUGG +EXTRA &#9888;</span>
+            {% elif cls == 'MATCH_IMPLICITO_AMBIGUO' %}
+              <span class="badge badge-amber">MATCH_AMBIGUO</span>
+            {% elif cls == 'MATCH_PARZIALE_OK' %}
+              <span class="badge badge-green">MATCH_PARZIALE</span>
+            {% elif cls == 'MATCH_PARZIALE_AMBIGUO' %}
+              <span class="badge badge-amber">PARZIALE_AMBIGUO</span>
+            {% elif cls == 'NO_ODA_CON_SUGGERIMENTI' %}
+              <span class="badge badge-blue">CON_SUGGERIMENTI</span>
+            {% elif cls == 'MAPPATURA_FORNITORE_FISSO' %}
+              <span class="badge badge-green">FORNITORE_FISSO</span>
+            {% elif cls == 'PARZIALE_CUMULATIVO_OK' %}
+              <span class="badge badge-green">PARZIALE_OK</span>
+            {% elif cls == 'TRASPORTO_OK' %}
+              <span class="badge badge-green">TRASPORTO</span>
+            {% elif cls == 'DA_VERIFICARE' %}
+              <span class="badge badge-amber">DA_VERIFICARE</span>
+            {% elif cls == 'CUMULATIVO_ECCEDE' %}
+              <span class="badge badge-red">CUMUL_ECCEDE</span>
+            {% elif cls == 'ODA_RIFERITO_NON_TROVATO' %}
+              <span class="badge badge-red">ODA_NF</span>
+            {% elif cls == 'NO_ODA_DA_CLASSIFICARE' %}
+              <span class="badge badge-purple">NO_ODA</span>
+            {% elif cls == 'COMMESSA_DETECTED' %}
+              <span class="badge badge-purple">COMMESSA</span>
+            {% else %}
+              <span class="badge badge-gray">{{ cls }}</span>
+            {% endif %}
+          </td>
+          <td class="px-3 py-2 text-right font-mono text-xs">
+            {% if inv['total_diff'] and inv['total_diff']|float != 0 %}
+              {{ "%+.2f"|format(inv['total_diff']|float) }}
+              <div class="text-gray-400">{{ "%.1f"|format(inv['total_diff_percent']|float) }}%</div>
+            {% else %}-{% endif %}
+          </td>
+          <td class="px-3 py-2 text-center">
+            <a href="/invoice/{{ inv['id'] }}" class="text-odoo-600 hover:text-odoo-800 text-xs">Dettaglio →</a>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="8" class="text-center py-8 text-gray-400">Nessuna fattura trovata</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if filters.get('class') and run_id %}
+<!-- Risultato bulk -->
+<div id="bulk-result" class="hidden mt-4 bg-white rounded-lg shadow p-5">
+  <h3 class="font-semibold mb-2 text-gray-700">Risultato</h3>
+  <div id="bulk-result-content" class="text-sm"></div>
+</div>
+
+<script>
+async function bulkCreateDrafts(tipoDoc, mode, classification) {
+  const label = tipoDoc === 'TD01' ? 'fatture' : 'note di credito';
+  if (!confirm(`Creare bozze per tutte le ${label} della run?`)) return;
+
+  const btnId = tipoDoc === 'TD01' ? 'btn-bulk-fatture' : 'btn-bulk-nc';
+  const btn = document.getElementById(btnId);
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Creazione in corso...';
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+  const resultDiv = document.getElementById('bulk-result');
+  const contentDiv = document.getElementById('bulk-result-content');
+  resultDiv.classList.remove('hidden');
+  contentDiv.innerHTML = '<span class="text-gray-500">Elaborazione in corso...</span>';
+
+  const endpoint = mode === 'oda'
+    ? '/api/odoo_write/bulk_drafts_from_oda/{{ run_id }}'
+    : '/api/odoo_write/bulk_create_drafts/{{ run_id }}';
+
+  const payload = {tipo_documento: tipoDoc};
+  if (mode === 'oda' && classification) {
+    payload.classification = classification;
+  }
+
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json();
+
+    let html = `<div class="grid grid-cols-4 gap-3 mb-3">
+      <div class="text-center p-2 bg-gray-50 rounded">
+        <div class="text-lg font-bold">${data.total}</div>
+        <div class="text-xs text-gray-500">Da creare</div>
+      </div>
+      <div class="text-center p-2 bg-emerald-50 rounded">
+        <div class="text-lg font-bold text-emerald-700">${data.created}</div>
+        <div class="text-xs text-gray-500">Create</div>
+      </div>
+      <div class="text-center p-2 bg-gray-50 rounded">
+        <div class="text-lg font-bold text-gray-500">${data.skipped}</div>
+        <div class="text-xs text-gray-500">Saltate</div>
+      </div>
+      <div class="text-center p-2 bg-red-50 rounded">
+        <div class="text-lg font-bold text-red-600">${data.errors}</div>
+        <div class="text-xs text-gray-500">Errori</div>
+      </div>
+    </div>`;
+
+    if (data.details && data.details.length > 0) {
+      html += '<div class="space-y-1 max-h-60 overflow-y-auto">';
+      for (const d of data.details) {
+        const icon = d.status === 'created' ? '&#10003;' :
+                     d.status === 'skipped' ? '&#8212;' : '&#10007;';
+        const color = d.status === 'created' ? 'text-emerald-600' :
+                      d.status === 'skipped' ? 'text-gray-500' : 'text-red-600';
+        const info = d.move_id ? `move_id=${d.move_id}` : (d.error || '');
+        html += `<div class="flex gap-2 text-xs ${color}">
+          <span>${icon}</span>
+          <span>Analisi #${d.analysis_id}</span>
+          <span class="text-gray-400">${info}</span>
+        </div>`;
+      }
+      html += '</div>';
+    }
+
+    contentDiv.innerHTML = html;
+
+    if (data.created > 0) {
+      btn.textContent = `${data.created} bozze create`;
+      btn.classList.add('bg-gray-400');
+    } else {
+      btn.textContent = origText;
+      btn.disabled = false;
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+    }
+  } catch (e) {
+    contentDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+    btn.textContent = origText;
+    btn.disabled = false;
+    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+  }
+}
+
+async function checkPendingReceptions(classification) {
+  classification = classification || 'AUTO_VALIDABILE';
+  const btn = document.getElementById('btn-check-receptions');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Verifica in corso...';
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+  const resultDiv = document.getElementById('bulk-result');
+  const contentDiv = document.getElementById('bulk-result-content');
+  resultDiv.classList.remove('hidden');
+  contentDiv.innerHTML = '<span class="text-gray-500">Verifica in corso...</span>';
+
+  try {
+    const r = await fetch(`/api/odoo_write/pending_receptions/{{ run_id }}?classification=${classification}`);
+    const data = await r.json();
+
+    if (!data.oda_in_attesa || data.oda_in_attesa.length === 0) {
+      contentDiv.innerHTML = `<span class="text-emerald-700">Nessuna ricezione mancante. Tutte le ${classification} sono pronte per la creazione bozza.</span>`;
+    } else {
+      let html = `<div class="mb-3"><strong>${data.totale_oda_in_attesa}</strong> OdA con righe da ricevere, <strong>${data.totale_fatture_bloccate}</strong> fatture bloccate.</div>`;
+      html += '<div class="space-y-3 max-h-96 overflow-y-auto">';
+      for (const o of data.oda_in_attesa) {
+        html += `<div class="border-l-4 border-amber-400 pl-3 py-1 bg-amber-50 rounded">`;
+        html += `<div class="font-semibold">${o.oda_name} - ${o.fornitore || ''}</div>`;
+        if (o.partner_ref) html += `<div class="text-xs text-gray-500">Rif: ${o.partner_ref}</div>`;
+        html += `<div class="text-xs mt-1"><strong>Fatture in attesa (${o.fatture_in_attesa.length}):</strong></div>`;
+        html += '<ul class="text-xs ml-3 list-disc">';
+        for (const ft of o.fatture_in_attesa) {
+          html += `<li>n. ${ft.numero} del ${ft.data} - €${parseFloat(ft.totale).toFixed(2)}</li>`;
+        }
+        html += '</ul>';
+        html += `<div class="text-xs mt-1"><strong>Righe da ricevere:</strong></div>`;
+        html += '<ul class="text-xs ml-3 list-disc">';
+        for (const r of o.righe_da_ricevere) {
+          html += `<li>${r.descrizione} (totale ${r.qty_totale}, ricevuto ${r.qty_ricevuta}, da ricevere <strong>${r.qty_da_ricevere}</strong>)</li>`;
+        }
+        html += '</ul>';
+        html += '</div>';
+      }
+      html += '</div>';
+      html += `<div class="mt-3 text-xs text-gray-500">Premi "Email magazzino" per generare il testo da inviare.</div>`;
+      contentDiv.innerHTML = html;
+    }
+  } catch (e) {
+    contentDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+  }
+  btn.textContent = origText;
+  btn.disabled = false;
+  btn.classList.remove('opacity-50', 'cursor-not-allowed');
+}
+
+async function bulkRollback(classification) {
+  if (!confirm(`Rollback bulk: cancellerà TUTTE le bozze ancora attive di questa run nella categoria "${classification}". Continuare?`)) return;
+  if (!confirm(`Conferma definitiva: questa azione è irreversibile (i move verranno unlinkati). Procedere?`)) return;
+
+  const btn = document.getElementById('btn-bulk-rollback');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Rollback in corso...';
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+  const resultDiv = document.getElementById('bulk-result');
+  const contentDiv = document.getElementById('bulk-result-content');
+  resultDiv.classList.remove('hidden');
+  contentDiv.innerHTML = '<span class="text-gray-500">Rollback in corso...</span>';
+
+  try {
+    const r = await fetch('/api/odoo_write/bulk_rollback/{{ run_id }}', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({classification: classification})
+    });
+    const data = await r.json();
+
+    let html = `<div class="grid grid-cols-3 gap-3 mb-3">
+      <div class="text-center p-2 bg-gray-50 rounded">
+        <div class="text-lg font-bold">${data.total}</div>
+        <div class="text-xs text-gray-500">Bozze trovate</div>
+      </div>
+      <div class="text-center p-2 bg-emerald-50 rounded">
+        <div class="text-lg font-bold text-emerald-700">${data.rolled_back}</div>
+        <div class="text-xs text-gray-500">Rollback OK</div>
+      </div>
+      <div class="text-center p-2 bg-red-50 rounded">
+        <div class="text-lg font-bold text-red-600">${data.errors}</div>
+        <div class="text-xs text-gray-500">Errori</div>
+      </div>
+    </div>`;
+    if (data.details && data.details.length > 0) {
+      html += '<div class="space-y-1 max-h-60 overflow-y-auto">';
+      for (const d of data.details) {
+        const icon = d.status === 'rolled_back' ? '&#10003;' : '&#10007;';
+        const color = d.status === 'rolled_back' ? 'text-emerald-600' : 'text-red-600';
+        const info = d.move_id ? `move_id=${d.move_id}` : (d.error || '');
+        html += `<div class="flex gap-2 text-xs ${color}">
+          <span>${icon}</span><span>Analisi #${d.analysis_id}</span>
+          <span class="text-gray-400">${info}</span>
+        </div>`;
+      }
+      html += '</div>';
+    }
+    contentDiv.innerHTML = html;
+  } catch (e) {
+    contentDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+  }
+  btn.textContent = origText;
+  btn.disabled = false;
+  btn.classList.remove('opacity-50', 'cursor-not-allowed');
+}
+</script>
+{% endif %}
+
+{% endblock %}

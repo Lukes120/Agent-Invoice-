@@ -1,0 +1,314 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Invoice Agent{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-2xl font-bold text-gray-800">Dashboard</h1>
+    <p class="text-sm text-gray-500">
+      {% if last_run %}
+        Ultima esecuzione: {{ last_run.started_at[:16].replace('T', ' ') }}
+        - {{ last_run.total_analyzed }} fatture analizzate
+      {% else %}
+        Nessuna esecuzione registrata
+      {% endif %}
+    </p>
+  </div>
+  <div class="flex gap-2">
+    <button id="sync-drafts-btn" onclick="syncDrafts()"
+            class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium px-4 py-2.5 rounded-lg transition text-sm">
+      Sincronizza bozze Odoo
+    </button>
+    <button id="run-btn" onclick="startRun()"
+            class="bg-odoo-main hover:bg-odoo-dark text-white font-medium px-5 py-2.5 rounded-lg shadow transition">
+      Esegui analisi adesso
+    </button>
+  </div>
+</div>
+
+<div id="sync-result" class="hidden bg-blue-50 border border-blue-200 text-blue-800 px-4 py-3 rounded mb-4 text-sm"></div>
+
+<!-- Pannello esecuzione in corso (nascosto di default) -->
+<div id="run-panel" class="hidden bg-white rounded-lg shadow p-5 mb-6">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="font-semibold">Esecuzione in corso</h2>
+    <span id="run-status" class="text-sm text-gray-500">In attesa...</span>
+  </div>
+  <div class="w-full bg-gray-200 rounded-full h-2 mb-3">
+    <div id="progress-bar" class="bg-odoo-main h-2 rounded-full transition-all"
+         style="width: 0%"></div>
+  </div>
+  <div id="run-log" class="bg-gray-900 text-green-300 rounded p-3 font-mono text-xs h-64 overflow-y-auto">
+    <div class="text-gray-500">Log esecuzione...</div>
+  </div>
+</div>
+
+<!-- KPI Grid -->
+{% if last_run and last_run.status == 'completed' %}
+<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4 mb-6">
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-blue-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Totale analizzate</div>
+    <div class="text-3xl font-bold text-blue-600 mt-1">{{ last_run.total_analyzed }}</div>
+    <div class="text-xs text-gray-400 mt-1">€{{ "{:,.0f}".format(last_run.total_amount or 0) }}</div>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-green-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Auto-validabili</div>
+    <div class="text-3xl font-bold text-green-600 mt-1">{{ last_run.auto_validabili }}</div>
+    <a href="/invoices?class=AUTO_VALIDABILE" class="text-xs text-green-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-emerald-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Match implicito</div>
+    <div class="text-3xl font-bold text-emerald-600 mt-1">{{ last_run.match_implicito or 0 }}</div>
+    <a href="/invoices?class=MATCH_IMPLICITO" class="text-xs text-emerald-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-teal-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Match parziale</div>
+    <div class="text-3xl font-bold text-teal-600 mt-1">{{ last_run.match_parziale or 0 }}</div>
+    <a href="/invoices?class=MATCH_PARZIALE_OK" class="text-xs text-teal-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-amber-400">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Match ambiguo</div>
+    <div class="text-3xl font-bold text-amber-500 mt-1">{{ (last_run.match_implicito_ambiguo or 0) + (last_run.match_parziale_ambiguo or 0) }}</div>
+    <a href="/invoices?class=MATCH_IMPLICITO_AMBIGUO,MATCH_PARZIALE_AMBIGUO" class="text-xs text-amber-500 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-green-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Parziali OK</div>
+    <div class="text-3xl font-bold text-green-600 mt-1">{{ last_run.parziali_cumul }}</div>
+    <a href="/invoices?class=PARZIALE_CUMULATIVO_OK" class="text-xs text-green-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-green-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Solo Trasporti</div>
+    <div class="text-3xl font-bold text-green-600 mt-1">{{ last_run.trasporto_ok }}</div>
+    <a href="/invoices?class=TRASPORTO_OK" class="text-xs text-green-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-amber-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Da verificare</div>
+    <div class="text-3xl font-bold text-amber-600 mt-1">{{ last_run.da_verificare }}</div>
+    <a href="/invoices?class=DA_VERIFICARE" class="text-xs text-amber-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-red-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Cumul. eccede</div>
+    <div class="text-3xl font-bold text-red-600 mt-1">{{ last_run.cumul_eccede }}</div>
+    <a href="/invoices?class=CUMULATIVO_ECCEDE" class="text-xs text-red-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-red-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">OdA non trovato</div>
+    <div class="text-3xl font-bold text-red-600 mt-1">{{ last_run.oda_non_trovato }}</div>
+    <a href="/invoices?class=ODA_RIFERITO_NON_TROVATO" class="text-xs text-red-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-emerald-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Fornitore Fisso</div>
+    <div class="text-3xl font-bold text-emerald-600 mt-1">{{ last_run.mappatura_fornitore or 0 }}</div>
+    <a href="/invoices?class=MAPPATURA_FORNITORE_FISSO" class="text-xs text-emerald-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-odoo-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Senza OdA (Fase 3)</div>
+    <div class="text-3xl font-bold text-odoo-600 mt-1">{{ last_run.no_oda }}</div>
+    <a href="/invoices?class=NO_ODA_DA_CLASSIFICARE" class="text-xs text-odoo-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-yellow-400">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Match da suggerimento ⚠</div>
+    <div class="text-3xl font-bold text-yellow-600 mt-1">{{ last_run.match_da_suggerimento or 0 }}</div>
+    <a href="/invoices?class=MATCH_DA_SUGGERIMENTO" class="text-xs text-yellow-700 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-orange-400">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Match suggerimento + extra ⚠</div>
+    <div class="text-3xl font-bold text-orange-600 mt-1">{{ last_run.match_da_suggerimento_extra or 0 }}</div>
+    <a href="/invoices?class=MATCH_DA_SUGGERIMENTO_PIU_EXTRA" class="text-xs text-orange-700 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-indigo-400">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Con suggerimenti (ambigui)</div>
+    <div class="text-3xl font-bold text-indigo-600 mt-1">{{ last_run.no_oda_con_suggerimenti or 0 }}</div>
+    <a href="/invoices?class=NO_ODA_CON_SUGGERIMENTI" class="text-xs text-indigo-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-odoo-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Commesse (Fase 2)</div>
+    <div class="text-3xl font-bold text-odoo-600 mt-1">{{ last_run.commesse }}</div>
+    <a href="/invoices?class=COMMESSA_DETECTED" class="text-xs text-odoo-600 hover:underline">Dettaglio →</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-gray-400">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Anomalie</div>
+    <div class="text-3xl font-bold text-gray-600 mt-1">{{ last_run.anomalie }}</div>
+    <a href="/invoices?class=ANOMALIA" class="text-xs text-gray-600 hover:underline">Dettaglio →</a>
+  </div>
+
+</div>
+
+<!-- Link rapidi -->
+<div class="bg-white rounded-lg shadow p-5">
+  <h2 class="font-semibold mb-3">Azioni rapide</h2>
+  <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+    <a href="/invoices?class=AUTO_VALIDABILE"
+       class="p-3 border rounded-lg hover:bg-green-50 transition flex items-center">
+      <div class="w-2 h-2 bg-green-500 rounded-full mr-3"></div>
+      <span class="text-sm">Auto-validabili</span>
+    </a>
+    <a href="/invoices?class=MATCH_IMPLICITO"
+       class="p-3 border rounded-lg hover:bg-emerald-50 transition flex items-center">
+      <div class="w-2 h-2 bg-emerald-500 rounded-full mr-3"></div>
+      <span class="text-sm">Match impliciti</span>
+    </a>
+    <a href="/invoices?class=MATCH_IMPLICITO_AMBIGUO"
+       class="p-3 border rounded-lg hover:bg-amber-50 transition flex items-center">
+      <div class="w-2 h-2 bg-amber-400 rounded-full mr-3"></div>
+      <span class="text-sm">Match da scegliere</span>
+    </a>
+    <a href="/invoices?class=DA_VERIFICARE"
+       class="p-3 border rounded-lg hover:bg-amber-50 transition flex items-center">
+      <div class="w-2 h-2 bg-amber-500 rounded-full mr-3"></div>
+      <span class="text-sm">Da verificare</span>
+    </a>
+    <a href="/invoices?class=CUMULATIVO_ECCEDE"
+       class="p-3 border rounded-lg hover:bg-red-50 transition flex items-center">
+      <div class="w-2 h-2 bg-red-500 rounded-full mr-3"></div>
+      <span class="text-sm">Allarmi sovra-fatturazione</span>
+    </a>
+    <a href="/history"
+       class="p-3 border rounded-lg hover:bg-gray-50 transition flex items-center">
+      <div class="w-2 h-2 bg-gray-500 rounded-full mr-3"></div>
+      <span class="text-sm">Storico esecuzioni</span>
+    </a>
+    <a href="/api/export/{{ last_run.id }}/all"
+       class="p-3 border rounded-lg hover:bg-blue-50 transition flex items-center">
+      <div class="w-2 h-2 bg-blue-500 rounded-full mr-3"></div>
+      <span class="text-sm">Esporta CSV completo</span>
+    </a>
+    <a href="/settings"
+       class="p-3 border rounded-lg hover:bg-odoo-50 transition flex items-center">
+      <div class="w-2 h-2 bg-odoo-500 rounded-full mr-3"></div>
+      <span class="text-sm">Configurazione</span>
+    </a>
+  </div>
+</div>
+{% else %}
+<div class="bg-white rounded-lg shadow p-8 text-center">
+  <h2 class="text-lg font-semibold mb-2">Nessuna esecuzione disponibile</h2>
+  <p class="text-gray-500 mb-4">Clicca "Esegui analisi adesso" per cominciare.</p>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function startRun() {
+  const btn = document.getElementById('run-btn');
+  const panel = document.getElementById('run-panel');
+  const logBox = document.getElementById('run-log');
+  const progressBar = document.getElementById('progress-bar');
+  const statusEl = document.getElementById('run-status');
+
+  btn.disabled = true;
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+  btn.textContent = 'In esecuzione...';
+  panel.classList.remove('hidden');
+  logBox.innerHTML = '';
+  progressBar.style.width = '0%';
+  statusEl.textContent = 'Avvio...';
+
+  fetch('/api/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  }).then(r => r.json()).then(data => {
+    if (!data.ok) {
+      appendLog('error', data.error || 'Errore');
+      resetBtn();
+      return;
+    }
+
+    const es = new EventSource('/api/logs/stream');
+    es.onmessage = (e) => {
+      const {level, msg} = JSON.parse(e.data);
+
+      if (level === 'progress') {
+        const pct = (msg.current / msg.total) * 100;
+        progressBar.style.width = pct + '%';
+        statusEl.textContent = `${msg.current}/${msg.total} - ${msg.supplier}`;
+      } else {
+        appendLog(level, msg);
+      }
+
+      if (level === 'done') {
+        es.close();
+        statusEl.textContent = 'Completato';
+        progressBar.style.width = '100%';
+        setTimeout(() => location.reload(), 1500);
+      } else if (level === 'error') {
+        es.close();
+        statusEl.textContent = 'Errore';
+        progressBar.classList.replace('bg-odoo-main', 'bg-red-500');
+        resetBtn();
+      }
+    };
+    es.onerror = () => {
+      es.close();
+    };
+  });
+
+  function appendLog(level, msg) {
+    const colors = {
+      info: 'text-green-300',
+      success: 'text-green-400 font-bold',
+      warn: 'text-yellow-400',
+      error: 'text-red-400 font-bold',
+      done: 'text-green-400 font-bold',
+    };
+    const el = document.createElement('div');
+    el.className = colors[level] || 'text-gray-300';
+    el.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg);
+    logBox.appendChild(el);
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function resetBtn() {
+    btn.disabled = false;
+    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+    btn.textContent = 'Esegui analisi adesso';
+  }
+}
+
+async function syncDrafts() {
+  const btn = document.getElementById('sync-drafts-btn');
+  const resultDiv = document.getElementById('sync-result');
+  btn.disabled = true;
+  btn.textContent = 'Sincronizzazione...';
+  resultDiv.classList.add('hidden');
+
+  try {
+    const r = await fetch('/api/odoo_write/sync_drafts', {method: 'POST'});
+    const data = await r.json();
+    resultDiv.classList.remove('hidden');
+    resultDiv.innerHTML = `<b>Sincronizzazione completata:</b> ` +
+      `${data.checked} bozze controllate, ` +
+      `${data.ok} ancora presenti, ` +
+      `<b>${data.restored} righe OdA ripristinate</b> ` +
+      (data.errors > 0 ? `, <span class="text-red-600">${data.errors} errori</span>` : '');
+  } catch (e) {
+    resultDiv.classList.remove('hidden');
+    resultDiv.classList.add('bg-red-50', 'border-red-200', 'text-red-800');
+    resultDiv.innerHTML = `Errore: ${e}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sincronizza bozze Odoo';
+  }
+}
+</script>
+{% endblock %}

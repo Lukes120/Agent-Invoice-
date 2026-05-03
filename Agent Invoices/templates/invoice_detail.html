@@ -1,0 +1,480 @@
+{% extends "base.html" %}
+{% block title %}{{ a['invoice_number'] }} - Dettaglio{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="javascript:history.back()" class="text-sm text-odoo-600 hover:underline">← Torna alla lista</a>
+</div>
+
+<div class="bg-white rounded-lg shadow p-6 mb-6">
+  <div class="flex items-start justify-between">
+    <div>
+      <div class="text-xs text-gray-500 uppercase font-semibold mb-1">Fattura</div>
+      <h1 class="text-2xl font-bold">{{ a['invoice_number'] or 'N/D' }}</h1>
+      <p class="text-gray-600 mt-1">{{ a['supplier_name'] }} — P.IVA {{ a['supplier_vat'] }}</p>
+    </div>
+    <div class="text-right">
+      <div class="text-3xl font-bold text-odoo-700">€{{ "{:,.2f}".format(a['invoice_total'] or 0) }}</div>
+      <div class="text-sm text-gray-500">{{ a['invoice_date'] }}</div>
+    </div>
+  </div>
+
+  <div class="mt-4 flex items-center gap-2">
+    {% set cls = a['classification'] %}
+    {% if cls in ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK', 'TRASPORTO_OK') %}
+      <span class="badge badge-green">{{ cls }}</span>
+    {% elif cls in ('DA_VERIFICARE', 'MATCH_IMPLICITO_AMBIGUO', 'MATCH_PARZIALE_AMBIGUO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA') %}
+      <span class="badge badge-amber">{{ cls }}</span>
+    {% elif cls in ('CUMULATIVO_ECCEDE', 'ODA_RIFERITO_NON_TROVATO', 'ANOMALIA') %}
+      <span class="badge badge-red">{{ cls }}</span>
+    {% elif cls in ('NO_ODA_DA_CLASSIFICARE', 'COMMESSA_DETECTED') %}
+      <span class="badge badge-purple">{{ cls }}</span>
+    {% elif cls == 'NO_ODA_CON_SUGGERIMENTI' %}
+      <span class="badge badge-blue">{{ cls }}</span>
+    {% elif cls == 'MAPPATURA_FORNITORE_FISSO' %}
+      <span class="badge badge-green">{{ cls }}</span>
+    {% else %}
+      <span class="badge badge-gray">{{ cls }}</span>
+    {% endif %}
+  </div>
+</div>
+
+{% if a['classification'] in ('MAPPATURA_FORNITORE_FISSO', 'AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA') %}
+<div class="bg-emerald-50 border border-emerald-200 rounded-lg p-5 mb-6">
+  {% if a['classification'] == 'MAPPATURA_FORNITORE_FISSO' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (mappatura fornitore fisso)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    Questa fattura può essere registrata automaticamente come bozza in Odoo
+    sulla base della mappatura fornitore fisso. La bozza verrà creata con
+    OdA, conto contabile e tasse pre-compilati. Potrai poi revisionarla in
+    Odoo e fare il post manualmente.
+  </p>
+  {% elif a['classification'] == 'AUTO_VALIDABILE' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (da OdA matchato)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    Questa fattura ha OdA esplicito e totale combaciante. La bozza verrà
+    creata replicando il flusso "Crea fattura da OdA": le righe vengono
+    ricostruite dalle PO line, conto e IVA dedotti dal prodotto.
+    Per merci, è richiesta la ricezione magazzino (qty_received).
+  </p>
+  {% elif a['classification'] == 'MATCH_IMPLICITO' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (da OdA dedotto - match implicito)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    Questa fattura non cita OdA nell'XML, ma è stato individuato univocamente
+    un OdA compatibile per fornitore + importo imponibile. Verifica che l'OdA
+    proposto sia corretto, poi crea la bozza: le righe verranno ricostruite
+    dalle PO line del PO matchato. Per merci, è richiesta la ricezione magazzino.
+  </p>
+  {% elif a['classification'] == 'MATCH_DA_SUGGERIMENTO' %}
+  <h2 class="font-semibold mb-3 text-amber-800">&#9888; Scrittura Odoo (da suggerimento - verifica manuale)</h2>
+  <div class="text-sm text-amber-800 mb-3 p-3 bg-amber-100 border border-amber-300 rounded">
+    <strong>Attenzione:</strong> bozza basata su un sotto-insieme di righe
+    dell'OdA che sommano l'imponibile della fattura (match al centesimo).
+    L'OdA non era citato nell'XML del fornitore: il match e' stato dedotto
+    automaticamente. Verifica MANUALMENTE l'OdA e le righe consumate prima
+    del posting in Odoo.
+  </div>
+  {% else %}
+  <h2 class="font-semibold mb-3 text-amber-800">&#9888; Scrittura Odoo (da suggerimento + spese accessorie)</h2>
+  <div class="text-sm text-amber-800 mb-3 p-3 bg-amber-100 border border-amber-300 rounded">
+    <strong>Attenzione:</strong> bozza basata su un sotto-insieme di righe
+    dell'OdA che sommano l'imponibile fattura entro una piccola tolleranza
+    (probabili spese accessorie tipo trasporto). Il writer aggiungera'
+    automaticamente una <strong>riga "Spese accessorie"</strong> sul conto
+    420110 per coprire il delta. Verifica MANUALMENTE l'OdA, le righe
+    consumate e l'entita' delle spese accessorie prima del posting.
+  </div>
+  {% endif %}
+
+  <div id="odoo-write-status" class="text-sm mb-3"></div>
+
+  <div class="flex gap-2 flex-wrap">
+    <button id="btn-create-draft" onclick="createDraft({{ a['id'] }}, '{{ a['classification'] }}')"
+            class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 text-sm">
+      Crea bozza in Odoo
+    </button>
+    <button id="btn-rollback" onclick="rollbackDraft({{ a['id'] }})"
+            class="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm hidden">
+      Rollback bozza
+    </button>
+    {% if a['classification'] in ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA') %}
+    <button id="btn-check-reception" onclick="checkReception({{ a['id'] }})"
+            class="px-4 py-2 bg-sky-600 text-white rounded hover:bg-sky-700 text-sm">
+      Verifica ricezione merce
+    </button>
+    <a href="/api/odoo_write/email_magazzino_single/{{ a['id'] }}" target="_blank"
+       class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 text-sm">
+      Email magazzino
+    </a>
+    {% endif %}
+    <button onclick="refreshStatus({{ a['id'] }})"
+            class="px-4 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">
+      Aggiorna stato
+    </button>
+  </div>
+
+  <div id="reception-status" class="hidden mt-3 p-3 bg-white rounded border border-emerald-200 text-sm"></div>
+</div>
+
+<script>
+async function refreshStatus(analysisId) {
+  const statusDiv = document.getElementById('odoo-write-status');
+  statusDiv.innerHTML = '<span class="text-gray-500">Caricamento stato...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/status/${analysisId}`);
+    const data = await r.json();
+    if (data.writes && data.writes.length > 0) {
+      const last = data.writes[0];
+      const rows = data.writes.map(w => {
+        const status = w.success ? '✓' : '✗';
+        const dr = w.dry_run ? '<span class="text-gray-500">[DRY_RUN]</span> ' : '';
+        const moveLink = w.move_id ?
+          `move_id=<b>${w.move_id}</b>` : '';
+        const err = w.error_message ? `<span class="text-red-600">${w.error_message}</span>` : '';
+        return `<div class="flex gap-2 items-start text-xs py-1 border-b border-emerald-100">
+          <span>${status}</span>
+          <span class="text-gray-500">${w.timestamp.substring(0,19)}</span>
+          <span class="font-mono">${w.action}</span>
+          ${dr} ${moveLink} ${err}
+        </div>`;
+      }).join('');
+      statusDiv.innerHTML = `<div class="bg-white rounded p-2">${rows}</div>`;
+
+      // Mostra/nascondi pulsanti — accetto sia create_draft che create_draft_from_oda
+      const lastCreate = data.writes.find(w =>
+        (w.action === 'create_draft' || w.action === 'create_draft_from_oda')
+        && w.success && !w.dry_run);
+      const lastRollback = data.writes.find(w =>
+        w.action === 'rollback' && w.success);
+
+      if (lastCreate && (!lastRollback || lastRollback.id < lastCreate.id)) {
+        document.getElementById('btn-create-draft').disabled = true;
+        document.getElementById('btn-create-draft').classList.add('opacity-50', 'cursor-not-allowed');
+        document.getElementById('btn-rollback').classList.remove('hidden');
+      } else {
+        document.getElementById('btn-create-draft').disabled = false;
+        document.getElementById('btn-create-draft').classList.remove('opacity-50', 'cursor-not-allowed');
+        document.getElementById('btn-rollback').classList.add('hidden');
+      }
+    } else {
+      statusDiv.innerHTML = '<span class="text-gray-500">Nessuna scrittura registrata</span>';
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+  }
+}
+
+async function createDraft(analysisId, classification) {
+  const btn = document.getElementById('btn-create-draft');
+  btn.disabled = true;
+  btn.textContent = 'Creazione in corso...';
+  // Endpoint dipende dalla categoria
+  const endpoint = (classification === 'AUTO_VALIDABILE'
+                    || classification === 'MATCH_IMPLICITO'
+                    || classification === 'MATCH_DA_SUGGERIMENTO'
+                    || classification === 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+    ? `/api/odoo_write/draft_from_oda/${analysisId}`
+    : `/api/odoo_write/create_draft/${analysisId}`;
+  try {
+    const r = await fetch(endpoint, {method: 'POST'});
+    const data = await r.json();
+    if (data.success) {
+      alert(`Bozza creata con successo! ${data.dry_run ? '(DRY_RUN)' : 'move_id=' + data.move_id}`);
+    } else {
+      alert(`Errore: ${data.error_message || data.error || 'sconosciuto'}`);
+    }
+  } catch (e) {
+    alert(`Errore rete: ${e}`);
+  } finally {
+    btn.textContent = 'Crea bozza in Odoo';
+    btn.disabled = false;
+    refreshStatus(analysisId);
+  }
+}
+
+async function rollbackDraft(analysisId) {
+  if (!confirm('Sicuro di voler cancellare la bozza in Odoo? Questa operazione cancellerà il record account.move e ripristinerà la riga OdA.')) {
+    return;
+  }
+  try {
+    const r = await fetch(`/api/odoo_write/rollback/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      alert('Rollback completato!');
+    } else {
+      alert(`Errore rollback: ${data.error_message || data.error || 'sconosciuto'}`);
+    }
+  } catch (e) {
+    alert(`Errore rete: ${e}`);
+  } finally {
+    refreshStatus(analysisId);
+  }
+}
+
+async function checkReception(analysisId) {
+  const btn = document.getElementById('btn-check-reception');
+  const box = document.getElementById('reception-status');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Verifica in corso...';
+  box.classList.remove('hidden');
+  box.innerHTML = '<span class="text-gray-500">Caricamento da Odoo...</span>';
+
+  try {
+    const r = await fetch(`/api/odoo_write/check_reception/${analysisId}`);
+    const data = await r.json();
+
+    if (!data.ok) {
+      box.innerHTML = `<span class="text-red-600">Errore: ${data.error || 'sconosciuto'}</span>`;
+      return;
+    }
+
+    let html = `<div class="font-semibold mb-2">OdA ${data.oda_name} — ${data.fornitore || ''}</div>`;
+    if (!data.righe_merce || data.righe_merce.length === 0) {
+      html += '<div class="text-emerald-700">✓ Tutti servizi: nessuna ricezione magazzino necessaria. La bozza può essere creata.</div>';
+    } else if (data.tutte_ricevute) {
+      html += `<div class="text-emerald-700 mb-2">✓ Tutte le ${data.righe_merce.length} righe merce sono state ricevute. La bozza può essere creata.</div>`;
+      html += '<table class="w-full text-xs mt-2"><thead><tr class="text-gray-500"><th class="text-left">Descrizione</th><th class="text-right">Totale</th><th class="text-right">Ricevuta</th><th class="text-right">Disponibile</th></tr></thead><tbody>';
+      for (const r of data.righe_merce) {
+        html += `<tr><td class="py-0.5">${r.descrizione}</td><td class="text-right">${r.qty_totale}</td><td class="text-right">${r.qty_ricevuta}</td><td class="text-right">${r.qty_disponibile_per_fattura}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    } else {
+      const blocked = data.righe_merce.filter(r => !r.ricevuta);
+      html += `<div class="text-amber-700 mb-2">&#9888; ${blocked.length} righe merce ancora da ricevere — la bozza NON può essere creata finché il magazzino non processa la ricezione.</div>`;
+      html += '<table class="w-full text-xs mt-2"><thead><tr class="text-gray-500"><th class="text-left">Descrizione</th><th class="text-right">Totale</th><th class="text-right">Ricevuta</th><th class="text-right">Da ricevere</th><th>Stato</th></tr></thead><tbody>';
+      for (const r of data.righe_merce) {
+        const status = r.ricevuta ? '<span class="text-emerald-600">&#10003;</span>' : '<span class="text-amber-600">&#9888;</span>';
+        const rowCls = r.ricevuta ? '' : 'bg-amber-50';
+        html += `<tr class="${rowCls}"><td class="py-0.5">${r.descrizione}</td><td class="text-right">${r.qty_totale}</td><td class="text-right">${r.qty_ricevuta}</td><td class="text-right font-semibold">${r.qty_da_ricevere}</td><td class="text-center">${status}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+
+// Carica stato all'apertura
+refreshStatus({{ a['id'] }});
+</script>
+{% endif %}
+
+{% if a['classification'] == 'DA_VERIFICARE' and a['oda_odoo'] %}
+<div class="bg-orange-50 border border-orange-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-3 text-orange-800">&#9888; Crea bozza libera da XML (importi fattura, scostamento OdA)</h2>
+  <div class="text-sm text-orange-800 mb-3 p-3 bg-orange-100 border border-orange-400 rounded">
+    <strong>Attenzione:</strong> questa fattura ha un riferimento OdA <strong>{{ a['oda_odoo'] }}</strong>
+    ma il totale e/o le righe non combaciano. Il flusso "bozza libera"
+    crea una bozza con gli importi <strong>reali della fattura</strong> (presi
+    dall'XML), <strong>senza toccare le PO line</strong> dell'OdA. La riconciliazione
+    contabile-OdA va fatta manualmente dal contabile prima del posting.
+    <ul class="list-disc ml-5 mt-2">
+      <li>Le righe vengono create 1:1 dalle righe XML</li>
+      <li>Il conto contabile e' dedotto dallo storico fornitore (oppure dall'OdA)</li>
+      <li>L'IVA viene mappata dall'aliquota XML</li>
+      <li>L'OdA viene riportato nel campo "Riferimento" del move (invoice_origin)</li>
+    </ul>
+  </div>
+
+  <div id="force-libera-status" class="text-sm mb-3"></div>
+
+  <div class="flex gap-2 flex-wrap">
+    <button id="btn-draft-libera" onclick="forceDraftLibera({{ a['id'] }})"
+            class="px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 text-sm">
+      Crea bozza libera da XML
+    </button>
+  </div>
+</div>
+
+<script>
+async function forceDraftLibera(analysisId) {
+  if (!confirm('Creare bozza libera dalle righe XML?\n\nL\'OdA verra\' riportato solo come riferimento testuale; le PO line NON saranno toccate.\n\nProcedere?')) return;
+  if (!confirm('CONFERMA DEFINITIVA: la bozza riportera\' gli importi della fattura (NON dell\'OdA). La riconciliazione contabile-OdA e\' a carico del contabile.\n\nVuoi davvero creare la bozza libera?')) return;
+
+  const btn = document.getElementById('btn-draft-libera');
+  const statusDiv = document.getElementById('force-libera-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione in corso...';
+  statusDiv.innerHTML = '<span class="text-gray-500">Creazione bozza libera...</span>';
+
+  try {
+    const r = await fetch(`/api/odoo_write/draft_libera/${analysisId}`, {method: 'POST'});
+    const data = await r.json();
+    if (data.success) {
+      statusDiv.innerHTML = `<span class="text-emerald-700">&#10003; Bozza creata! ${data.dry_run ? '[DRY_RUN]' : 'move_id=' + data.move_id}</span>`;
+      btn.textContent = 'Bozza creata';
+      btn.classList.add('bg-gray-400', 'opacity-60', 'cursor-not-allowed');
+      // resta disabled
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">Errore: ${data.error_message || data.error || 'sconosciuto'}</span>`;
+      btn.textContent = 'Crea bozza libera da XML';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+    btn.textContent = 'Crea bozza libera da XML';
+    btn.disabled = false;
+  }
+}
+</script>
+{% endif %}
+
+{% if a['classification'] in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
+                               'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
+<div class="bg-sky-50 border border-sky-200 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-3 text-sky-800">Verifica magazzino</h2>
+  <p class="text-sm text-sky-700 mb-3">
+    Per questa categoria la creazione bozza non e' attivata in automatico,
+    ma puoi verificare lo stato della ricezione delle merci sull'OdA matchato
+    e generare una email per il magazzino se mancano ricezioni.
+  </p>
+
+  <div class="flex gap-2 flex-wrap">
+    <button id="btn-check-reception-only" onclick="checkReceptionOnly({{ a['id'] }})"
+            class="px-4 py-2 bg-sky-600 text-white rounded hover:bg-sky-700 text-sm">
+      Verifica ricezione merce
+    </button>
+    <a href="/api/odoo_write/email_magazzino_single/{{ a['id'] }}" target="_blank"
+       class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 text-sm">
+      Email magazzino
+    </a>
+  </div>
+
+  <div id="reception-status-only" class="hidden mt-3 p-3 bg-white rounded border border-sky-200 text-sm"></div>
+</div>
+
+<script>
+async function checkReceptionOnly(analysisId) {
+  const btn = document.getElementById('btn-check-reception-only');
+  const box = document.getElementById('reception-status-only');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Verifica in corso...';
+  box.classList.remove('hidden');
+  box.innerHTML = '<span class="text-gray-500">Caricamento da Odoo...</span>';
+
+  try {
+    const r = await fetch(`/api/odoo_write/check_reception/${analysisId}`);
+    const data = await r.json();
+
+    if (!data.ok) {
+      box.innerHTML = `<span class="text-red-600">Errore: ${data.error || 'sconosciuto'}</span>`;
+      return;
+    }
+
+    let html = `<div class="font-semibold mb-2">OdA ${data.oda_name} &mdash; ${data.fornitore || ''}</div>`;
+    if (!data.righe_merce || data.righe_merce.length === 0) {
+      html += '<div class="text-emerald-700">&#10003; Tutti servizi: nessuna ricezione magazzino necessaria.</div>';
+    } else if (data.tutte_ricevute) {
+      html += `<div class="text-emerald-700 mb-2">&#10003; Tutte le ${data.righe_merce.length} righe merce sono state ricevute.</div>`;
+      html += '<table class="w-full text-xs mt-2"><thead><tr class="text-gray-500"><th class="text-left">Descrizione</th><th class="text-right">Totale</th><th class="text-right">Ricevuta</th></tr></thead><tbody>';
+      for (const r of data.righe_merce) {
+        html += `<tr><td class="py-0.5">${r.descrizione}</td><td class="text-right">${r.qty_totale}</td><td class="text-right">${r.qty_ricevuta}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    } else {
+      const blocked = data.righe_merce.filter(r => !r.ricevuta);
+      html += `<div class="text-amber-700 mb-2">&#9888; ${blocked.length} righe merce ancora da ricevere.</div>`;
+      html += '<table class="w-full text-xs mt-2"><thead><tr class="text-gray-500"><th class="text-left">Descrizione</th><th class="text-right">Totale</th><th class="text-right">Ricevuta</th><th class="text-right">Da ricevere</th><th>Stato</th></tr></thead><tbody>';
+      for (const r of data.righe_merce) {
+        const status = r.ricevuta ? '<span class="text-emerald-600">&#10003;</span>' : '<span class="text-amber-600">&#9888;</span>';
+        const rowCls = r.ricevuta ? '' : 'bg-amber-50';
+        html += `<tr class="${rowCls}"><td class="py-0.5">${r.descrizione}</td><td class="text-right">${r.qty_totale}</td><td class="text-right">${r.qty_ricevuta}</td><td class="text-right font-semibold">${r.qty_da_ricevere}</td><td class="text-center">${status}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+}
+</script>
+{% endif %}
+
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+
+  <div class="bg-white rounded-lg shadow p-5">
+    <h2 class="font-semibold mb-3 text-gray-700">Ordine di Acquisto</h2>
+    <dl class="text-sm space-y-2">
+      <div class="flex justify-between">
+        <dt class="text-gray-500">OdA nell'XML:</dt>
+        <dd class="font-mono">{{ a['oda_xml'] or '-' }}</dd>
+      </div>
+      <div class="flex justify-between">
+        <dt class="text-gray-500">OdA trovato in Odoo:</dt>
+        <dd class="font-mono text-odoo-700">{{ a['oda_odoo'] or 'non trovato' }}</dd>
+      </div>
+      {% if a['total_diff'] and a['total_diff']|float != 0 %}
+      <div class="flex justify-between">
+        <dt class="text-gray-500">Differenza vs OdA:</dt>
+        <dd class="font-mono {% if a['total_diff']|float > 0 %}text-red-600{% else %}text-amber-600{% endif %}">
+          {{ "%+.2f €"|format(a['total_diff']|float) }}
+          ({{ "%.1f"|format(a['total_diff_percent']|float) }}%)
+        </dd>
+      </div>
+      {% endif %}
+    </dl>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-5">
+    <h2 class="font-semibold mb-3 text-gray-700">Analisi cumulativa</h2>
+    {% if a['cumulative_count'] and a['cumulative_count']|int > 0 %}
+    <dl class="text-sm space-y-2">
+      <div class="flex justify-between">
+        <dt class="text-gray-500">Altre fatture su stesso OdA:</dt>
+        <dd class="font-semibold">{{ a['cumulative_count'] }}</dd>
+      </div>
+      <div class="flex justify-between">
+        <dt class="text-gray-500">Già fatturato:</dt>
+        <dd class="font-mono">€{{ "{:,.2f}".format(a['cumulative_others']|float) }}</dd>
+      </div>
+    </dl>
+    {% else %}
+    <p class="text-sm text-gray-400">Nessuna altra fattura sullo stesso OdA.</p>
+    {% endif %}
+
+    {% if a['commesse'] %}
+    <div class="mt-3 pt-3 border-t">
+      <div class="text-xs text-gray-500 uppercase">Commesse rilevate</div>
+      <div class="font-mono text-odoo-700">{{ a['commesse'] }}</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="bg-white rounded-lg shadow p-5 mb-6">
+  <h2 class="font-semibold mb-3 text-gray-700">Azione suggerita</h2>
+  {% if a['actions'] %}
+    {% for action in a['actions'].split('|') %}
+      <p class="text-sm py-1">{{ action.strip() }}</p>
+    {% endfor %}
+  {% else %}
+    <p class="text-sm text-gray-400">Nessuna azione specifica.</p>
+  {% endif %}
+</div>
+
+{% if a['warnings'] %}
+<div class="bg-yellow-50 border border-yellow-200 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-yellow-800">Attenzione</h2>
+  {% for w in a['warnings'].split('|') %}
+    <p class="text-sm text-yellow-700 py-1">{{ w.strip() }}</p>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="bg-white rounded-lg shadow p-5">
+  <h2 class="font-semibold mb-3 text-gray-700">Allegato originale</h2>
+  <div class="text-xs font-mono text-gray-500 break-all">{{ a['attachment_name'] }}</div>
+</div>
+
+{% endblock %}

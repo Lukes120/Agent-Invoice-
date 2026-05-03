@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Storico - Invoice Agent{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+  <h1 class="text-2xl font-bold text-gray-800">Storico esecuzioni</h1>
+  <p class="text-sm text-gray-500">{{ runs|length }} esecuzioni registrate</p>
+</div>
+
+<div class="bg-white rounded-lg shadow overflow-hidden">
+  <table class="w-full text-sm">
+    <thead class="bg-gray-50">
+      <tr>
+        <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">ID</th>
+        <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Inizio</th>
+        <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Stato</th>
+        <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Totale</th>
+        <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase text-green-600">Auto+Parz</th>
+        <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase text-amber-600">Verifica</th>
+        <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase text-red-600">Allarmi</th>
+        <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Importo</th>
+        <th class="text-center px-3 py-2"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-gray-100">
+      {% for r in runs %}
+      <tr class="hover:bg-gray-50">
+        <td class="px-3 py-2 font-mono text-xs">#{{ r['id'] }}</td>
+        <td class="px-3 py-2">{{ r['started_at'][:16].replace('T', ' ') }}</td>
+        <td class="px-3 py-2">
+          {% if r['status'] == 'completed' %}
+            <span class="badge badge-green">completato</span>
+          {% elif r['status'] == 'running' %}
+            <span class="badge badge-blue">in corso</span>
+          {% else %}
+            <span class="badge badge-gray">{{ r['status'] }}</span>
+          {% endif %}
+        </td>
+        <td class="px-3 py-2 text-right font-semibold">{{ r['total_analyzed'] or 0 }}</td>
+        <td class="px-3 py-2 text-right text-green-700">
+          {{ (r['auto_validabili'] or 0) + (r['parziali_cumul'] or 0) + (r['trasporto_ok'] or 0) }}
+        </td>
+        <td class="px-3 py-2 text-right text-amber-700">{{ r['da_verificare'] or 0 }}</td>
+        <td class="px-3 py-2 text-right text-red-700">
+          {{ (r['cumul_eccede'] or 0) + (r['oda_non_trovato'] or 0) }}
+        </td>
+        <td class="px-3 py-2 text-right font-mono text-xs">
+          €{{ "{:,.0f}".format(r['total_amount'] or 0) }}
+        </td>
+        <td class="px-3 py-2 text-center">
+          <a href="/invoices/{{ r['id'] }}" class="text-odoo-600 hover:text-odoo-800 text-xs">Vedi →</a>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="9" class="text-center py-8 text-gray-400">Nessuna esecuzione</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}

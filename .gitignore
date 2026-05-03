@@ -1,0 +1,78 @@
+# =====================================================
+# Credenziali e dati sensibili
+# =====================================================
+config/credentials.env
+*.env
+
+# =====================================================
+# Database SQLite (dashboard.db locale, anche subdirectory)
+# =====================================================
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# =====================================================
+# Output, cache di analisi, report generati
+# =====================================================
+output/
+logs/
+reports/
+
+# =====================================================
+# XML campioni con dati fornitori reali (prudenza)
+# =====================================================
+xml_samples/
+
+# =====================================================
+# Python
+# =====================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtualenvs
+venv/
+.venv/
+env/
+ENV/
+
+# Distribuzione / build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =====================================================
+# Editor / IDE / OS
+# =====================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =====================================================
+# Plan files locali (Claude)
+# =====================================================
+.claude/
+
+# =====================================================
+# File temporanei / dump di sviluppo
+# =====================================================
+.tmp_*
+*.tmp
+*.bak
+# Artefatti shell vuoti (apostrofo, '0')
+'
+"0"
+0

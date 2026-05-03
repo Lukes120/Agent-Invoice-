@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Configurazione - Invoice Agent{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+  <h1 class="text-2xl font-bold text-gray-800">Configurazione</h1>
+  <p class="text-sm text-gray-500">Visualizzazione parametri correnti. Le modifiche si applicano in config/rules.py</p>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+  <div class="bg-white rounded-lg shadow p-5">
+    <h2 class="font-semibold mb-3 text-gray-700">Tolleranze</h2>
+    <dl class="text-sm space-y-3">
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Tolleranza percentuale</dt>
+        <dd class="text-2xl font-bold text-odoo-700">{{ tol_percent }}%</dd>
+      </div>
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Tolleranza assoluta (riga)</dt>
+        <dd class="text-2xl font-bold text-odoo-700">€{{ tol_absolute }}</dd>
+      </div>
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Tolleranza totale fattura</dt>
+        <dd class="text-2xl font-bold text-odoo-700">€{{ tol_total }}</dd>
+      </div>
+    </dl>
+    <p class="text-xs text-gray-400 mt-4">
+      Regola: la fattura passa se lo scostamento è entro UNA delle due soglie (OR).
+    </p>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-5">
+    <h2 class="font-semibold mb-3 text-gray-700">Stato sistema</h2>
+    <dl class="text-sm space-y-3">
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Fase attiva</dt>
+        <dd class="text-xl font-semibold text-odoo-700">Fase 1 - OdA matching</dd>
+      </div>
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Modalità Odoo</dt>
+        <dd><span class="badge badge-green">Sola lettura</span></dd>
+      </div>
+      <div>
+        <dt class="text-gray-500 text-xs uppercase">Logica cumulativa</dt>
+        <dd><span class="badge badge-green">Attiva</span></dd>
+      </div>
+    </dl>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-5 md:col-span-2">
+    <h2 class="font-semibold mb-3 text-gray-700">Roadmap</h2>
+    <div class="space-y-3">
+      <div class="flex items-start gap-3">
+        <div class="w-6 h-6 bg-green-100 rounded-full flex items-center justify-center flex-shrink-0">
+          <span class="text-green-700 text-xs font-bold">✓</span>
+        </div>
+        <div>
+          <div class="font-medium">Fase 1 - Matching OdA</div>
+          <div class="text-xs text-gray-500">Riconoscimento e matching fatture con OdA di acquisto, logica cumulativa</div>
+        </div>
+      </div>
+      <div class="flex items-start gap-3">
+        <div class="w-6 h-6 bg-gray-100 rounded-full flex items-center justify-center flex-shrink-0">
+          <span class="text-gray-500 text-xs">2</span>
+        </div>
+        <div>
+          <div class="font-medium text-gray-600">Fase 2 - Matching Commesse S#####</div>
+          <div class="text-xs text-gray-500">Riconoscimento commesse di vendita per imputazione costi a progetti cliente</div>
+        </div>
+      </div>
+      <div class="flex items-start gap-3">
+        <div class="w-6 h-6 bg-gray-100 rounded-full flex items-center justify-center flex-shrink-0">
+          <span class="text-gray-500 text-xs">3</span>
+        </div>
+        <div>
+          <div class="font-medium text-gray-600">Fase 3 - Anagrafica fornitori fissi</div>
+          <div class="text-xs text-gray-500">Mapping automatico per utenze/leasing/servizi senza OdA</div>
+        </div>
+      </div>
+      <div class="flex items-start gap-3">
+        <div class="w-6 h-6 bg-gray-100 rounded-full flex items-center justify-center flex-shrink-0">
+          <span class="text-gray-500 text-xs">4</span>
+        </div>
+        <div>
+          <div class="font-medium text-gray-600">Fase 4 - Invio email automatico e schedulazione</div>
+          <div class="text-xs text-gray-500">Report giornaliero via email a mailing list contabilità</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
