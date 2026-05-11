@@ -23,6 +23,7 @@ Uso tipico:
 import base64
 import calendar
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
@@ -43,6 +44,10 @@ class WriteResult:
     dry_run: bool = False
     # Multi-linea: righe OdA aggiuntive consumate/create (oltre a po_line_id)
     extra_po_lines: Optional[List[Dict]] = None
+    # POL aggiunte all'OdA per gestire righe accessorie (trasporto/bolli/...)
+    # Necessario al rollback per de-creare anche queste righe quando si elimina
+    # il move. Lista di int (purchase.order.line.id).
+    added_po_line_ids: Optional[List[int]] = None
 
     def to_dict(self) -> Dict:
         d = {
@@ -58,6 +63,8 @@ class WriteResult:
         }
         if self.extra_po_lines:
             d['extra_po_lines'] = self.extra_po_lines
+        if self.added_po_line_ids:
+            d['added_po_line_ids'] = self.added_po_line_ids
         return d
 
 
@@ -76,6 +83,59 @@ class OdooWriter:
         self.dry_run = dry_run
 
     # === Helpers === #
+
+    def _find_pol_autostrade_match(self, po_id: int, cc: str,
+                                      classificazione: str,
+                                      excluded_ids: Optional[set] = None) -> List[Dict]:
+        """Cerca POL libere su un OdA Autostrade che match (cc + cls).
+
+        Pattern descrizione P03718: "PEDAGGI AUTOSTRADALI\\nCodice cliente:
+        NNN\\n<furgoni|uso promiscuo>".
+
+        Strategia priorità:
+        1. POL cc-specifica (descrizione contiene SOLO il cc richiesto)
+        2. POL jolly (descrizione contiene il cc richiesto + altri cc)
+
+        Filtri base: qty_invoiced=0 AND qty_received=0 AND product_qty>=1.
+
+        excluded_ids: insieme di POL già "prenotate" da altre fatture nello
+        stesso batch (per evitare di consumare 2 volte la stessa riga).
+
+        Ritorna lista di POL (cc-specific prima, poi jolly), ordinata per id.
+        """
+        excluded = excluded_ids or set()
+        cls_token = classificazione.replace('_', ' ')  # uso_promiscuo -> uso promiscuo
+        lines = self.client._call('purchase.order.line', 'search_read',
+            [('order_id', '=', po_id)],
+            fields=['id', 'name', 'product_id', 'product_qty',
+                     'price_unit', 'qty_invoiced', 'qty_received',
+                     'taxes_id', 'account_analytic_id', 'date_planned',
+                     'product_uom'])
+
+        cc_specific = []
+        jolly = []
+        for ln in lines:
+            if ln['id'] in excluded:
+                continue
+            if ((ln.get('qty_invoiced') or 0) != 0
+                or (ln.get('qty_received') or 0) != 0
+                or (ln.get('product_qty') or 0) < 1):
+                continue
+            desc = (ln.get('name') or '').lower()
+            if cc not in desc or cls_token not in desc:
+                continue
+            # Conto quanti cc distinti compaiono nella descrizione (jolly se
+            # >1, cc-specific se solo 1).
+            ccs_in_desc = re.findall(r'\b\d{8,12}\b', ln.get('name') or '')
+            unique_ccs = set(ccs_in_desc)
+            if len(unique_ccs) <= 1:
+                cc_specific.append(ln)
+            else:
+                jolly.append(ln)
+
+        cc_specific.sort(key=lambda l: l['id'])
+        jolly.sort(key=lambda l: l['id'])
+        return cc_specific + jolly
 
     def _find_libere_purchase_order_lines(self, po_id: int,
                                            criterio: str = 'standard_qty_inv_rec') -> List[Dict]:
@@ -457,7 +517,7 @@ class OdooWriter:
     def _end_of_month(self, date_str: str) -> str:
         """
         Dato '2026-04-02' ritorna '2026-04-30' (ultimo giorno del mese).
-        Usato per calcolare la Data Competenza IVA italiana.
+        Usato come fallback per la data contabile quando manca la data SdI.
         """
         if not date_str or '-' not in date_str:
             return date_str
@@ -470,6 +530,29 @@ class OdooWriter:
         except Exception as e:
             logger.warning(f"_end_of_month errore su '{date_str}': {e}")
             return date_str
+
+    def _data_contabile(self, analysis, invoice_date: str) -> str:
+        """
+        Convenzione Ecotel (decisa 2026-05-04 con contabilità):
+        la data contabile (= data competenza IVA, opzione A) coincide con la
+        DATA DI RICEZIONE SdI dell'allegato, cioè il `create_date` del record
+        `fatturapa.attachment.in` su Odoo, troncato a 'YYYY-MM-DD'.
+
+        Fallback: se per qualche motivo `attachment_create_date` non è
+        disponibile (es. analisi vecchia ricaricata da DB, import manuale
+        senza propagazione), torno alla logica precedente fine mese della
+        data fattura.
+        """
+        cd = getattr(analysis, 'attachment_create_date', '') or ''
+        if cd:
+            # Odoo serializza datetime come 'YYYY-MM-DD HH:MM:SS'. Tronco.
+            cd = cd.strip()
+            date_part = cd.split(' ')[0] if ' ' in cd else cd[:10]
+            if len(date_part) >= 10 and date_part[4] == '-' and date_part[7] == '-':
+                return date_part
+            logger.warning(f"_data_contabile: create_date inatteso '{cd}', "
+                           f"fallback a fine mese di '{invoice_date}'")
+        return self._end_of_month(invoice_date)
 
     # === Azione principale: crea bozza fattura fornitore fisso === #
 
@@ -650,15 +733,16 @@ class OdooWriter:
 
             # Calcolo data competenza IVA = fine mese della data fattura.
             # Vale anche per NC (regola convenzionale italiana liquidazione IVA).
-            data_competenza = self._end_of_month(invoice_date)
+            data_contabile = self._data_contabile(analysis, invoice_date)
+            data_competenza_iva = self._end_of_month(invoice_date)
 
             move_type = 'in_refund' if is_nota_credito else 'in_invoice'
             move_vals = {
                 'partner_id': mapping_entry['partner_id'],
                 'move_type': move_type,
                 'invoice_date': invoice_date,
-                'date': data_competenza,
-                'l10n_it_vat_settlement_date': data_competenza,
+                'date': data_contabile,
+                'l10n_it_vat_settlement_date': data_competenza_iva,
                 'ref': invoice_number,
                 'invoice_origin': oda_name,
                 'journal_id': mapping_entry['journal_id'],
@@ -848,6 +932,213 @@ class OdooWriter:
                    f"desc='{description[:60]}'")
         return new_line_id
 
+    def _classify_extra_line(self, descrizione: str) -> str:
+        """Classifica una riga extra della fattura via keyword.
+        Ritorna la categoria (TRASPORTO/BOLLO/ONERI_BANCARI/...) o '_DEFAULT'."""
+        from config.rules import KEYWORD_RULES
+        desc_lower = (descrizione or '').lower()
+        for kw, _conto_key, categoria in KEYWORD_RULES:
+            if kw in desc_lower:
+                return categoria
+        return '_DEFAULT'
+
+    def _add_extra_pol_to_oda(self, po_id, extra_line_xml, template_po_line,
+                              invoice_date) -> Optional[Dict]:
+        """
+        Crea una purchase.order.line dedicata sull'OdA per una riga extra
+        (accessoria) della fattura: trasporto, bollo, oneri bancari, ecc.
+
+        Pattern operatore (audit storico 90 giorni): il 100% delle righe
+        accessorie nelle fatture posted è collegato a una POL specifica
+        dell'OdA — l'addetto integra l'OdA con una riga dedicata e poi
+        registra il move che si linka regolarmente. Questo helper emula
+        esattamente quel comportamento.
+
+        Args:
+          po_id: ID purchase.order esistente (state=purchase, to invoice)
+          extra_line_xml: dict-like con keys 'descrizione', 'prezzo_totale',
+                          'aliquota_iva', 'quantita'
+          template_po_line: una POL esistente del PO da cui ereditare
+                            product_uom e account_analytic_id (consistenza
+                            commessa analitica con le altre righe merce)
+          invoice_date: stringa YYYY-MM-DD per date_planned
+
+        Returns:
+          dict con i dati della POL appena creata, formato compatibile con
+          po_lines_data (id, name, product_id, product_qty, product_uom,
+          qty_received, qty_invoiced, price_unit, price_subtotal, taxes_id,
+          account_analytic_id) + campo extra '_account_id_override' che il
+          caller usa per forzare l'account_id sulla move_line.
+          In dry-run, 'id' = None (POL non realmente creata).
+          Ritorna None se la riga è inammissibile (importo 0, oltre soglia).
+        """
+        from config.rules import (EXTRA_POL_MAPPING_ECOTEL,
+                                   EXTRA_POL_TAX_BY_IVA_ECOTEL,
+                                   ADD_EXTRA_POL_MAX_AMOUNT)
+
+        # Estrazione dati riga (gestisce sia dict che dataclass FatturaPALine)
+        if hasattr(extra_line_xml, 'descrizione'):
+            desc = (extra_line_xml.descrizione or '').strip()
+            amount = float(extra_line_xml.prezzo_totale or 0)
+            aliquota = float(extra_line_xml.aliquota_iva or 22.0)
+            quantita = float(extra_line_xml.quantita or 1)
+        else:
+            desc = (extra_line_xml.get('descrizione') or '').strip()
+            # Fallback su 'prezzo' per retrocompat (analyzer legacy)
+            amount = float(extra_line_xml.get('prezzo_totale')
+                          or extra_line_xml.get('prezzo') or 0)
+            aliquota = float(extra_line_xml.get('aliquota_iva') or 22.0)
+            quantita = float(extra_line_xml.get('quantita') or 1)
+
+        if amount <= 0:
+            return None
+        if amount > ADD_EXTRA_POL_MAX_AMOUNT:
+            logger.warning(
+                f"Extra POL skipped: amount EUR {amount:.2f} > soglia "
+                f"EUR {ADD_EXTRA_POL_MAX_AMOUNT:.2f} ('{desc[:40]}')")
+            return None
+        if quantita <= 0:
+            quantita = 1.0
+
+        # 1. Classifica via keyword
+        categoria = self._classify_extra_line(desc)
+        mapping = EXTRA_POL_MAPPING_ECOTEL.get(
+            categoria, EXTRA_POL_MAPPING_ECOTEL['_DEFAULT'])
+        product_id = mapping['product_id']
+        account_id_override = mapping['account_id']
+
+        # 2. Tax id da aliquota IVA della riga XML
+        tax_id = EXTRA_POL_TAX_BY_IVA_ECOTEL.get(aliquota)
+        if tax_id is None:
+            # Fallback prudente: 22% G (caso più comune Ecotel)
+            tax_id = EXTRA_POL_TAX_BY_IVA_ECOTEL.get(22.0)
+            logger.warning(f"Extra POL: aliquota {aliquota}% non mappata, "
+                          f"fallback 22% G (tax_id={tax_id})")
+        tax_ids_list = [tax_id] if tax_id else []
+
+        # 3. UoM dalla POL template (default Units=1)
+        product_uom = template_po_line.get('product_uom') if template_po_line else None
+        if isinstance(product_uom, list):
+            product_uom = product_uom[0]
+        elif not product_uom:
+            product_uom = 1
+
+        # 4. Analitico dalla POL template (per coerenza commessa)
+        analytic = None
+        if template_po_line:
+            a = template_po_line.get('account_analytic_id')
+            if isinstance(a, list) and a:
+                analytic = a[0]
+
+        # 5. Calcolo price_unit; subtotal stimato = amount (entra nei controlli totale)
+        price_unit = amount / quantita if quantita > 0 else amount
+
+        vals = {
+            'order_id': po_id,
+            'name': desc,
+            'product_id': product_id,
+            'product_qty': quantita,
+            'product_uom': product_uom,
+            'price_unit': price_unit,
+            # qty_received NON impostato qui: il writer principale
+            # (in create_bozza_da_oda_matched) farà il ciclo finale di
+            # aggiornamento qty_received_manual sommando il delta fatturato.
+            # Se settassimo qui qty_received=quantita, il delta verrebbe
+            # sommato 2 volte → quantità ricevuta = 2 sull'OdA (bug).
+            'taxes_id': [(6, 0, tax_ids_list)],
+            'date_planned': invoice_date,
+        }
+        if analytic:
+            vals['account_analytic_id'] = analytic
+
+        # 6. Crea (o simula in dry-run)
+        if self.dry_run:
+            logger.info(
+                f"[DRY_RUN] Simulato create extra POL cat={categoria} "
+                f"po_id={po_id} desc='{desc[:60]}' amount=EUR {amount:.2f}")
+            new_pol_id = None
+        else:
+            new_pol_id = self.client._call(
+                'purchase.order.line', 'create', vals)
+            if isinstance(new_pol_id, list):
+                new_pol_id = new_pol_id[0] if new_pol_id else None
+            logger.info(
+                f"Created extra POL id={new_pol_id} cat={categoria} "
+                f"po_id={po_id} desc='{desc[:60]}' amount=EUR {amount:.2f}")
+
+        # Ritorno dict compatibile con po_lines_data.
+        # qty_received=0 e qty_received_manual=0 perché il ciclo finale del
+        # writer somma il delta fatturato (delta=quantita) ai valori esistenti
+        # → risultato finale qty_received=quantita corretto.
+        return {
+            'id': new_pol_id,
+            'name': desc,
+            'product_id': [product_id, ''],   # formato Odoo Many2one
+            'product_qty': quantita,
+            'product_uom': [product_uom, ''],
+            'qty_received': 0.0,
+            'qty_received_manual': 0.0,
+            'qty_invoiced': 0.0,
+            'price_unit': price_unit,
+            'price_subtotal': round(price_unit * quantita, 2),
+            'taxes_id': tax_ids_list,
+            'account_analytic_id': [analytic, ''] if analytic else False,
+            '_extra_categoria': categoria,
+            '_account_id_override': account_id_override,
+        }
+
+    def _cleanup_extra_pols(self, added_po_line_ids):
+        """
+        Best-effort cleanup delle POL extra create da _add_extra_pol_to_oda
+        quando la creazione bozza fallisce DOPO l'aggiunta (es. discrepanza
+        imponibile, missing_account, not_received).
+
+        Strategia: prima tento unlink (passa solo se OdA in stato 'draft');
+        se fallisce per stato 'purchase', azzero la riga (qty=0, price=0,
+        prefisso "[ANNULLATA]" nel nome). La POL non sparisce ma non incide
+        sui totali OdA. Mai solleva eccezione: il fail di cleanup non deve
+        bloccare il fail principale che si sta riportando al chiamante.
+        """
+        if not added_po_line_ids:
+            return
+        if self.dry_run:
+            logger.info(f"[DRY_RUN] cleanup POL extra simulato: {added_po_line_ids}")
+            return
+        try:
+            existing = self.client._call(
+                'purchase.order.line', 'search_read',
+                [('id', 'in', list(added_po_line_ids))],
+                fields=['id', 'name'])
+        except Exception as e:
+            logger.warning(f"Cleanup POL extra: lettura fallita "
+                           f"{added_po_line_ids}: {e}")
+            return
+        for pol in existing:
+            pol_id = pol['id']
+            orig_name = pol.get('name', '') or ''
+            try:
+                self.client._call('purchase.order.line', 'unlink', [pol_id])
+                logger.warning(f"Cleanup: rimossa POL extra id={pol_id} "
+                               f"dopo fail bozza")
+            except Exception:
+                try:
+                    new_name = orig_name
+                    if not new_name.startswith('[ANNULLATA]'):
+                        new_name = f"[ANNULLATA] {orig_name}"
+                    self.client._call('purchase.order.line', 'write',
+                        [pol_id], {
+                            'product_qty': 0,
+                            'price_unit': 0,
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                            'name': new_name,
+                        })
+                    logger.warning(f"Cleanup: azzerata POL extra id={pol_id} "
+                                   f"(qty=0, price=0, prefix [ANNULLATA])")
+                except Exception as e2:
+                    logger.error(f"Cleanup POL extra {pol_id} fallito "
+                                 f"completamente (POL fantasma sull'OdA): {e2}")
+
     def create_bozza_multilinea(self, analysis, mapping_entry: Dict) -> WriteResult:
         """
         Crea bozza per fornitori multi-linea (es. Telecom).
@@ -901,7 +1192,8 @@ class OdooWriter:
         indennita_config = mapping_entry.get('indennita_config')
         invoice_date = analysis.xml_data.data or ''
         invoice_number = analysis.xml_data.numero or ''
-        data_competenza = self._end_of_month(invoice_date)
+        data_contabile = self._data_contabile(analysis, invoice_date)
+        data_competenza_iva = self._end_of_month(invoice_date)
 
         # === Costruisco le assegnazioni: quali righe XML vanno su quali PO line ===
         # Ogni entry: {'po_line': dict, 'amount': float, 'description': str,
@@ -1127,8 +1419,8 @@ class OdooWriter:
                 'partner_id': mapping_entry['partner_id'],
                 'move_type': move_type,
                 'invoice_date': invoice_date,
-                'date': data_competenza,
-                'l10n_it_vat_settlement_date': data_competenza,
+                'date': data_contabile,
+                'l10n_it_vat_settlement_date': data_competenza_iva,
                 'ref': invoice_number,
                 'invoice_origin': oda_name,
                 'journal_id': mapping_entry['journal_id'],
@@ -1286,25 +1578,102 @@ class OdooWriter:
         # Ordino per sequence per riprodurre l'ordine UI
         po_lines_data.sort(key=lambda l: (l.get('sequence') or 0, l['id']))
 
-        # Per MATCH_DA_SUGGERIMENTO[_PIU_EXTRA] l'analyzer ha trovato un
-        # SOTTOINSIEME di righe OdA che sommano l'imponibile fattura (al
-        # centesimo, oppure con un piccolo extra per spese accessorie).
-        # Filtro po_lines_data solo a quelle righe per non fatturare l'OdA pieno.
+        # Subset filtering — due percorsi possibili, entrambi consumano solo
+        # un sottoinsieme delle righe OdA (non l'intero ordine):
+        #   1) MATCH_DA_SUGGERIMENTO[_PIU_EXTRA]: line_ids da analysis.suggested_pos[0]
+        #      (subset trovato cercando combinazioni di righe OdA che sommano l'imp.)
+        #   2) MATCH_PARZIALE_OK ledger pattern (RWS-style): line_ids da
+        #      analysis.partial_match_subset_lines popolato da
+        #      _try_oda_ledger_subset_match nel CASO 3 quando la fattura consuma
+        #      una/piu' righe libere di un OdA-ledger ricorrente.
         suggested_pos = getattr(analysis, 'suggested_pos', None) or []
-        is_subset_match = analysis.classification in (
-            'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+        ledger_subset = getattr(analysis, 'partial_match_subset_lines', None) or []
+
+        is_subset_suggested = (
+            analysis.classification in ('MATCH_DA_SUGGERIMENTO',
+                                         'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+            and suggested_pos and suggested_pos[0].get('match_line_ids'))
+        is_subset_ledger = (
+            analysis.classification == 'MATCH_PARZIALE_OK' and ledger_subset)
+
         extra_amount = 0.0
-        if (is_subset_match and suggested_pos
-                and suggested_pos[0].get('match_line_ids')):
+        subset_ids = None
+        subset_source = None
+
+        if is_subset_suggested:
             subset_ids = set(suggested_pos[0]['match_line_ids'])
+            extra_amount = float(suggested_pos[0].get('extra_amount') or 0)
+            subset_source = 'MATCH_DA_SUGGERIMENTO'
+        elif is_subset_ledger:
+            subset_ids = set(ledger_subset)
+            subset_source = 'MATCH_PARZIALE_OK (ledger)'
+
+        if subset_ids is not None:
             po_lines_data = [pl for pl in po_lines_data if pl['id'] in subset_ids]
             if not po_lines_data:
                 return WriteResult(success=False, action='create_draft_from_oda',
-                                   error_message=f"Subset MATCH_DA_SUGGERIMENTO "
+                                   error_message=f"Subset {subset_source} "
                                                  f"{sorted(subset_ids)} non trovato "
                                                  f"tra le righe OdA",
                                    dry_run=self.dry_run)
-            extra_amount = float(suggested_pos[0].get('extra_amount') or 0)
+
+        # === Pattern operatore: aggiunta POL extra all'OdA ===
+        # Per MATCH_PARZIALE_OK con righe extra (analysis.partial_extra_lines
+        # popolato da _try_partial_match), creo una purchase.order.line
+        # dedicata sull'OdA per ogni riga extra. Replica il flusso operatore
+        # storico (audit step14b: 100% righe accessorie collegate a POL).
+        from config.rules import ADD_EXTRA_POL_TO_ODA_ENABLED
+        added_po_line_ids = []
+        partial_extra_lines = getattr(analysis, 'partial_extra_lines', None) or []
+        is_partial_with_extras = (
+            analysis.classification == 'MATCH_PARZIALE_OK'
+            and partial_extra_lines
+            and ADD_EXTRA_POL_TO_ODA_ENABLED)
+
+        if is_partial_with_extras and po_lines_data:
+            # Uso la prima POL come template per UoM/analytic
+            template_pol = po_lines_data[0]
+            invoice_date_planned = analysis.xml_data.data or None
+            for extra in partial_extra_lines:
+                # Skip silenzioso delle righe extra a importo 0 (descrizioni
+                # informative del fornitore senza addebito reale, es. Wuerth
+                # "SPESE-GESTIONE-INCASSO €0", "SPESE-SPEDIZIONE-MINIMO €0").
+                if hasattr(extra, 'prezzo_totale'):
+                    extra_amount = float(extra.prezzo_totale or 0)
+                else:
+                    extra_amount = float(extra.get('prezzo_totale')
+                                          or extra.get('prezzo') or 0)
+                extra_desc = (extra.get('descrizione') if isinstance(extra, dict)
+                               else getattr(extra, 'descrizione', '')) or ''
+                if extra_amount <= 0:
+                    logger.info(
+                        f"Skip riga extra a importo 0: '{extra_desc[:60]}'")
+                    continue
+
+                new_pol = self._add_extra_pol_to_oda(
+                    po_id=po.get('id'),
+                    extra_line_xml=extra,
+                    template_po_line=template_pol,
+                    invoice_date=invoice_date_planned)
+                if new_pol is None:
+                    # _add_extra_pol_to_oda ritorna None per amount > soglia
+                    # (amount <= 0 è già skippato sopra)
+                    from config.rules import ADD_EXTRA_POL_MAX_AMOUNT
+                    self._cleanup_extra_pols(added_po_line_ids)
+                    return WriteResult(
+                        success=False, action='create_draft_from_oda',
+                        error_message=(
+                            f"Riga extra oltre soglia €{ADD_EXTRA_POL_MAX_AMOUNT:.2f}: "
+                            f"'{extra_desc[:60]}' (€{extra_amount:.2f})"),
+                        dry_run=self.dry_run)
+                # Aggiungo la nuova POL al pool da fatturare
+                po_lines_data.append(new_pol)
+                if new_pol.get('id'):
+                    added_po_line_ids.append(new_pol['id'])
+            if added_po_line_ids:
+                logger.info(
+                    f"Aggiunte {len(added_po_line_ids)} POL extra all'OdA "
+                    f"{po.get('name')}: ids={added_po_line_ids}")
 
         # Recupero info dei prodotti (account, type) — passando il context
         # company_id perché property_account_expense_id è company-dependent
@@ -1385,6 +1754,15 @@ class OdooWriter:
             if qty_to_invoice <= 0.001:
                 continue  # già fatturata o residuo trascurabile
 
+            # === Override per POL extra (trasporto/bolli/...) ===
+            # Le POL aggiunte da _add_extra_pol_to_oda hanno un override esplicito
+            # del conto contabile (es. 420110 per trasporto). Bypassa la
+            # heuristica per garantire che la riga finisca sul conto corretto.
+            override_acc = pl.get('_account_id_override')
+            if override_acc:
+                billable_lines.append((pl, qty_to_invoice, prod_data, override_acc))
+                continue
+
             # Determino conto contabile in 3 step:
             # 1) Heuristica storica: conto top usato per questo fornitore
             #    nelle ultime fatture posted (>= 80% delle righe). È il più
@@ -1419,6 +1797,7 @@ class OdooWriter:
             details = "; ".join(
                 f"PO line {n['po_line_id']} prodotto '{n['product']}'"
                 for n in missing_account[:5])
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(
                 success=False, action='create_draft_from_oda',
                 error_message=f"Conto contabile non configurato su {len(missing_account)} "
@@ -1432,6 +1811,7 @@ class OdooWriter:
                 f"PO line {n['po_line_id']} '{n['name']}' "
                 f"(qty totale {n['qty_total']:.2f}, ricevuto {n['qty_received']:.2f})"
                 for n in not_received[:5])
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(
                 success=False, action='create_draft_from_oda',
                 error_message=f"Merce non ancora ricevuta dal magazzino su "
@@ -1440,6 +1820,7 @@ class OdooWriter:
             )
 
         if not billable_lines:
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(success=False, action='create_draft_from_oda',
                                error_message=f"OdA {po.get('name')}: nessuna riga "
                                             f"da fatturare (tutto già fatturato)",
@@ -1457,6 +1838,7 @@ class OdooWriter:
         if diff > tolerance and not (
                 analysis.classification == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA'
                 and is_subset_match):
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(
                 success=False, action='create_draft_from_oda',
                 error_message=(f"Discrepanza tra imponibile fattura (€{imponibile_xml:.2f}) "
@@ -1475,6 +1857,7 @@ class OdooWriter:
             currency_id = currency_id[0]
         partner_id = partner_id_po  # estratto sopra
         if not partner_id:
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(success=False, action='create_draft_from_oda',
                                error_message="partner_id non determinato dal PO",
                                dry_run=self.dry_run)
@@ -1486,6 +1869,7 @@ class OdooWriter:
         journals = self.client._call('account.journal', 'search_read',
             journal_domain, fields=['id', 'name'], limit=1)
         if not journals:
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(success=False, action='create_draft_from_oda',
                                error_message=f"Nessun giornale di acquisto per company {company_id}",
                                dry_run=self.dry_run)
@@ -1526,37 +1910,75 @@ class OdooWriter:
                 ml_vals['analytic_account_id'] = analytic[0]
             move_line_vals.append((0, 0, ml_vals))
 
-        # Per MATCH_DA_SUGGERIMENTO_PIU_EXTRA: aggiungo riga "spese accessorie"
-        # con il delta tra imponibile fattura e somma righe OdA matchate.
-        # Account 420110 = costi di trasporto e spedizione (id=125 Ecotel).
+        # Per MATCH_DA_SUGGERIMENTO_PIU_EXTRA: aggiungo una riga col delta
+        # tra imponibile fattura e somma righe OdA matchate.
+        # Due rami:
+        #  1) |delta| <= ROUNDING_THRESHOLD_AMOUNT -> ARROTONDAMENTO: la riga
+        #     eredita OdA / product / UoM / commessa / IVA dalla prima POL
+        #     matchata e usa il conto 410100 merci c/acquisti.
+        #  2) |delta| > soglia -> SPESE ACCESSORIE legacy su 420110, no aggancio
+        #     OdA (caso Sonepar trasporto +EUR 5 ecc.).
         if (analysis.classification == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA'
                 and abs(extra_amount) > 0.01):
-            sgn = -1 if is_nota_credito else 1
-            extra_qty = sgn * 1
-            extra_price = sgn * abs(extra_amount)
-            # IVA: prendo la prima dell'OdA matchato (probabilmente coerente).
-            extra_tax_ids = []
-            if billable_lines:
-                first_pl = billable_lines[0][0]
-                pl_taxes = first_pl.get('taxes_id') or []
+            from config.rules import (ROUNDING_THRESHOLD_AMOUNT,
+                                      ROUNDING_ACCOUNT_ID_ECOTEL)
+            # Convenzione segni:
+            # - Fattura normale: qty=1, price=extra_amount (mantiene segno).
+            # - Nota di credito: qty=-1, price=extra_amount -> subtotal segno
+            #   speculare al non-NC, coerente con la convenzione Ecotel
+            #   (qty=-1, price=-X -> subtotal positivo).
+            extra_qty = -1 if is_nota_credito else 1
+            extra_price = extra_amount
+
+            first_pl = billable_lines[0][0] if billable_lines else None
+            pl_taxes = (first_pl.get('taxes_id') or []) if first_pl else []
+
+            if (abs(extra_amount) <= ROUNDING_THRESHOLD_AMOUNT
+                    and first_pl is not None):
+                extra_ml = {
+                    'name': 'Arrotondamento',
+                    'quantity': extra_qty,
+                    'price_unit': extra_price,
+                    'account_id': ROUNDING_ACCOUNT_ID_ECOTEL,
+                    'purchase_line_id': first_pl['id'],
+                    'tax_ids': [(6, 0, list(pl_taxes))] if pl_taxes
+                               else [(6, 0, [])],
+                }
+                prod = first_pl.get('product_id')
+                if isinstance(prod, list) and prod:
+                    extra_ml['product_id'] = prod[0]
+                uom = first_pl.get('product_uom')
+                if isinstance(uom, list) and uom:
+                    extra_ml['product_uom_id'] = uom[0]
+                analytic = first_pl.get('account_analytic_id')
+                if isinstance(analytic, list) and analytic:
+                    extra_ml['analytic_account_id'] = analytic[0]
+                logger.info(
+                    f"Aggiunta riga arrotondamento: EUR {extra_price:+.2f} "
+                    f"agganciata a POL {first_pl['id']} (OdA {po.get('name')})"
+                )
+            else:
+                # Spese accessorie reali (delta grande, es. trasporto)
+                extra_ml = {
+                    'name': 'Spese accessorie (trasporto/contributi)',
+                    'quantity': extra_qty,
+                    'price_unit': extra_price,
+                    'account_id': 125,  # 420110 trasporto e spedizione
+                }
                 if pl_taxes:
-                    extra_tax_ids = list(pl_taxes)
-            extra_ml = {
-                'name': 'Spese accessorie (trasporto/contributi)',
-                'quantity': extra_qty,
-                'price_unit': extra_price,
-                'account_id': 125,  # 420110 costi di trasporto e spedizione
-            }
-            if extra_tax_ids:
-                extra_ml['tax_ids'] = [(6, 0, extra_tax_ids)]
+                    extra_ml['tax_ids'] = [(6, 0, list(pl_taxes))]
+                logger.info(
+                    f"Aggiunta riga spese accessorie: EUR {extra_price:+.2f}"
+                )
+
             move_line_vals.append((0, 0, extra_ml))
-            logger.info(f"Aggiunta riga spese accessorie: EUR {extra_price:.2f}")
 
         # Payment term dal partner
         payment_term_id = self._get_partner_payment_term(partner_id)
 
         # Data competenza IVA = fine mese
-        data_competenza = self._end_of_month(invoice_date)
+        data_contabile = self._data_contabile(analysis, invoice_date)
+        data_competenza_iva = self._end_of_month(invoice_date)
 
         # Guard: l'agent opera SOLO su Ecotel (company_id=1).
         # Se il PO appartiene a un'altra company, blocco per evitare scritture
@@ -1564,6 +1986,7 @@ class OdooWriter:
         if not company_id:
             company_id = 1  # default Ecotel se mancante
         if company_id != 1:
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(
                 success=False, action='create_draft_from_oda',
                 error_message=f"OdA {po.get('name')} appartiene a company_id={company_id} "
@@ -1576,8 +1999,8 @@ class OdooWriter:
             'partner_id': partner_id,
             'move_type': move_type,
             'invoice_date': invoice_date,
-            'date': data_competenza,
-            'l10n_it_vat_settlement_date': data_competenza,
+            'date': data_contabile,
+            'l10n_it_vat_settlement_date': data_competenza_iva,
             'ref': invoice_number,
             'invoice_origin': po.get('name'),
             'journal_id': journal_id,
@@ -1612,6 +2035,7 @@ class OdooWriter:
                     {'po_line_id': pl['id']}
                     for pl, _, _, _ in billable_lines[1:]
                 ] if len(billable_lines) > 1 else None,
+                added_po_line_ids=added_po_line_ids or None,
             )
 
         # === SCRITTURA REALE ===
@@ -1687,10 +2111,1332 @@ class OdooWriter:
                     {'po_line_id': pl['id']}
                     for pl, _, _, _ in billable_lines[1:]
                 ] if len(billable_lines) > 1 else None,
+                added_po_line_ids=added_po_line_ids or None,
             )
         except Exception as e:
             logger.exception("Errore create_bozza_da_oda_matched")
+            # Compensazione: se ho aggiunto POL extra ma il move è fallito,
+            # uso l'helper centralizzato che gestisce anche OdA in state=purchase
+            # (fallback [ANNULLATA]).
+            self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(success=False, action='create_draft_from_oda',
+                               error_message=str(e), dry_run=False)
+
+    def create_bozza_autostrade(self, analysis, mapping_entry: Dict,
+                                  pdf_split: Optional[Dict] = None) -> WriteResult:
+        """
+        Crea bozza per fattura Autostrade per l'Italia (IT07516911000).
+
+        Pattern decifrato in plans/crispy-napping-tower.md sez. 3.2:
+
+        - cc Ecotel main (261713569 / 217718183 / 216875601 / 311531633) →
+          OdA P03718, consume-POL: cerca 2 POL libere (1 furgoni + 1 uso
+          promiscuo) matchando cc + classificazione nella descrizione,
+          aggiorna price_unit/name/qty_received e collega le move_line via
+          purchase_line_id (pattern Trenitalia/Italo dal 07/05/2026).
+          - Se pdf_split fornito (R4): usa i 2 importi calcolati dal parser
+            PDF + APPARATI_MAP.
+          - Altrimenti (R1 fallback): 2 righe a importo 0 — il contabile
+            aggiorna manualmente in Odoo. La bozza ha comunque conti, IVA,
+            narrazione, cc, OdA pre-popolati.
+          - Selezione POL: priorità a POL cc-specifica (descrizione contiene
+            solo quel cc), poi POL jolly (descrizione multi-cc) come
+            fallback.
+
+        cc ex-Utterson e residuo chiusi 07/05/2026: il classifier non li
+        risolve più, eventuali fatture residue cadono in DA_VERIFICARE.
+        Le branche cc_type='ex_utterson'/'residuo' qui sotto restano per
+        compatibilità storica ma non sono più raggiunte dal flow normale.
+
+        WriteResult: po_line_id+old_* della 1ª POL (furgoni), extra_po_lines
+        per la 2ª (uso_promiscuo). Audit/rollback usano entrambe.
+
+        Args:
+            analysis: FatturaPAAnalysis con xml_data e codice_cliente popolati
+            mapping_entry: voce di MAPPATURA_FORNITORI_FISSI già risolta
+                           (con `cc_type` e `oda_fisso` del contratto matchato)
+            pdf_split: dict opzionale dell'output di
+                       `core.pdf_parser.calcola_split_furgoni_promiscuo`
+
+        Returns: WriteResult con success/move_id/error_message.
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc not in ('TD01',):
+            # Autostrade emette solo TD01 (verificato 80 XML in v3 sez. 1.2)
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=f"Tipo {tipo_doc} non supportato "
+                                             f"per Autostrade (atteso TD01)",
+                               dry_run=self.dry_run)
+
+        cc = getattr(analysis.xml_data, 'codice_cliente', None)
+        if not cc:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message="codice_cliente mancante in XML",
+                               dry_run=self.dry_run)
+
+        cc_type = mapping_entry.get('cc_type')
+        oda_name = mapping_entry.get('oda_fisso')
+        if not cc_type or not oda_name:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=f"mapping_entry incompleto: "
+                                             f"cc_type={cc_type}, oda={oda_name}",
+                               dry_run=self.dry_run)
+
+        # Cerca OdA su Odoo (Ecotel only)
+        ECOTEL = 1
+        pos = self.client._call('purchase.order', 'search_read',
+            [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+            fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+            limit=1)
+        if not pos:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=f"OdA {oda_name} non trovato su Ecotel",
+                               dry_run=self.dry_run)
+        po = pos[0]
+        po_id = po['id']
+        po_name = po['name']
+        partner_id = (po['partner_id'][0]
+                      if isinstance(po['partner_id'], list) else None)
+        currency_id = (po['currency_id'][0]
+                       if isinstance(po['currency_id'], list) else None)
+
+        if not partner_id:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=f"OdA {oda_name} senza partner",
+                               dry_run=self.dry_run)
+
+        # Imponibile XML totale fattura
+        imponibile_xml = float(analysis.xml_data.imponibile_totale or 0)
+        if imponibile_xml <= 0:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message="imponibile XML <= 0",
+                               dry_run=self.dry_run)
+
+        # Determina le righe move da creare in base a cc_type + pdf_split
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+        tax_id = (mapping_entry.get('taxes_id') or [11])[0]  # 22% S default
+        conto_furgoni = mapping_entry.get('conto_furgoni_id', 368)
+        conto_promiscuo = mapping_entry.get('conto_promiscuo_id', 1124)
+
+        move_lines_vals = []
+        # POL info per consume-POL pattern (Autostrade ecotel_main).
+        # Lista di dict {po_line_id, old_price_unit, old_name, old_date_planned,
+        # cls_token, new_price, new_name, account_id, product_id, product_uom_id,
+        # account_analytic_id} — usata per audit/rollback E per popolare le
+        # move_line_vals con purchase_line_id corretto.
+        consumed_pol_info: List[Dict] = []
+
+        if cc_type == 'ecotel_main':
+            # Consume-POL: per la fattura cerchiamo 2 POL libere su P03718,
+            # una furgoni e una promiscuo, matchate per cc + classificazione
+            # nella descrizione. Pattern Trenitalia/Italo applicato.
+            if pdf_split:
+                imp_furg = float(pdf_split.get('imponibile_furgoni', 0))
+                imp_prom = float(pdf_split.get('imponibile_promiscuo', 0))
+            else:
+                imp_furg = 0.0
+                imp_prom = 0.0
+
+            chosen_ids: set = set()
+            for cls, conto, imp_val in (
+                ('furgoni', conto_furgoni, imp_furg),
+                ('uso_promiscuo', conto_promiscuo, imp_prom),
+            ):
+                cands = self._find_pol_autostrade_match(po_id, cc, cls,
+                                                          excluded_ids=chosen_ids)
+                if not cands:
+                    return WriteResult(
+                        success=False, action='create_draft_autostrade',
+                        error_message=(
+                            f"Nessuna POL libera trovata su {po_name} per "
+                            f"cc={cc} classificazione={cls}. "
+                            f"Aggiungere righe disponibili sull'OdA."),
+                        dry_run=self.dry_run)
+                pol = cands[0]
+                chosen_ids.add(pol['id'])
+                # Estraggo product_id, uom, analytic dalla POL
+                _prod = pol.get('product_id')
+                product_id = _prod[0] if isinstance(_prod, list) else _prod
+                _uom = pol.get('product_uom')
+                product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+                _aa = pol.get('account_analytic_id')
+                analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+                cls_label = 'furgoni' if cls == 'furgoni' else 'uso promiscuo'
+                # Formato allineato alle POL inserite manualmente dagli
+                # operatori sullo stesso OdA P03718 (pattern verificato su
+                # 20+ POL gen-mar 2026: stringa multi-line con 3 righe
+                # separate da \n). Niente prefisso OdA, niente FT/data.
+                new_name = (f"PEDAGGI AUTOSTRADALI\n"
+                             f"Codice cliente: {cc}\n"
+                             f"{cls_label}")
+                consumed_pol_info.append({
+                    'po_line_id': pol['id'],
+                    'old_price_unit': pol.get('price_unit') or 0,
+                    'old_name': pol.get('name') or '',
+                    'old_date_planned': pol.get('date_planned') or None,
+                    'cls': cls,
+                    'cls_label': cls_label,
+                    'new_price': round(imp_val, 2),
+                    'new_name': new_name,
+                    'account_id': conto,
+                    'product_id': product_id,
+                    'product_uom_id': product_uom_id,
+                    'analytic_account_id': analytic_id,
+                })
+                ml_vals = {
+                    'name': new_name,
+                    'account_id': conto,
+                    'price_unit': round(imp_val, 2),
+                    'quantity': 1,
+                    'tax_ids': [(6, 0, [tax_id])],
+                    'purchase_line_id': pol['id'],
+                }
+                if product_id:
+                    ml_vals['product_id'] = product_id
+                if product_uom_id:
+                    ml_vals['product_uom_id'] = product_uom_id
+                if analytic_id:
+                    ml_vals['analytic_account_id'] = analytic_id
+                move_lines_vals.append(ml_vals)
+        elif cc_type in ('ex_utterson', 'residuo'):
+            # 1 sola riga totale in 420160
+            move_lines_vals.append({
+                'name': f"{po_name}: Pedaggi Autostradali "
+                        f"({'ex UTT ' if cc_type == 'ex_utterson' else ''})"
+                        f"FT n. {invoice_number} del {invoice_date} | "
+                        f"Codice cliente: {cc}",
+                'account_id': conto_furgoni,  # 420160 sempre
+                'price_unit': round(imponibile_xml, 2),
+                'quantity': 1,
+                'tax_ids': [(6, 0, [tax_id])],
+            })
+        else:
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=f"cc_type sconosciuto: {cc_type}",
+                               dry_run=self.dry_run)
+
+        # Journal acquisti Ecotel
+        journal_id = mapping_entry.get('journal_id', 2)
+
+        # Costruzione vals move
+        move_vals = {
+            'move_type': 'in_invoice',
+            'partner_id': partner_id,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': po_name,
+            'journal_id': journal_id,
+            'company_id': ECOTEL,
+            'currency_id': currency_id,
+            'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
+        }
+
+        if self.dry_run:
+            tot_lines = sum(ml['price_unit'] for ml in move_lines_vals)
+            consumed_str = ', '.join(
+                f"POL {p['po_line_id']} ({p['cls']}, "
+                f"€{p['old_price_unit']:.2f}->€{p['new_price']:.2f})"
+                for p in consumed_pol_info)
+            logger.info(
+                f"[DRY_RUN] create_bozza_autostrade cc={cc} cc_type={cc_type} "
+                f"OdA={po_name} righe={len(move_lines_vals)} "
+                f"consume-POL=[{consumed_str}] "
+                f"tot_imponibile_lines={tot_lines:.2f} "
+                f"vs imponibile_xml={imponibile_xml:.2f} "
+                f"pdf_split={'YES' if pdf_split else 'no (R1 manual fallback)'}"
+            )
+            # Per dry-run popolo po_line_id+old_* della prima POL e
+            # extra_po_lines col resto (compatibile con audit DB)
+            primary = consumed_pol_info[0] if consumed_pol_info else {}
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'cls': p['cls']}
+                for p in consumed_pol_info[1:]
+            ] if consumed_pol_info else None
+            return WriteResult(success=True, action='create_draft_autostrade',
+                               move_id=None, dry_run=True,
+                               po_line_id=primary.get('po_line_id'),
+                               old_price_unit=primary.get('old_price_unit'),
+                               old_name=primary.get('old_name'),
+                               old_date_planned=primary.get('old_date_planned'),
+                               extra_po_lines=extras)
+
+        try:
+            # Step 1: aggiorno le 2 POL libere col prezzo+nome della fattura
+            # PRIMA di creare il move (così il purchase_line_id è valido).
+            for p in consumed_pol_info:
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'product_qty': 1,
+                        'qty_received': 1,
+                        'qty_received_manual': 1,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(f"Updated POL {p['po_line_id']} ({p['cls']}): "
+                           f"price={p['new_price']:.2f}, qty_received=1")
+
+            # Step 2: creo account.move con le 2 move_line linkate alle POL
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(f"Created Autostrade move {move_id} cc={cc} OdA={po_name} "
+                       f"consume-POL ids={[p['po_line_id'] for p in consumed_pol_info]}")
+
+            # Allego XML al move
+            if analysis.raw_xml:
+                try:
+                    attachment_vals = {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    }
+                    self.client._call('ir.attachment', 'create', attachment_vals)
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito (non blocca): {e}")
+
+            # Marco fatturapa.attachment.in come registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito (non blocca): {e}")
+
+            # Audit per rollback
+            primary = consumed_pol_info[0] if consumed_pol_info else {}
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'cls': p['cls']}
+                for p in consumed_pol_info[1:]
+            ] if consumed_pol_info else None
+            return WriteResult(success=True, action='create_draft_autostrade',
+                               move_id=move_id, dry_run=False,
+                               po_line_id=primary.get('po_line_id'),
+                               old_price_unit=primary.get('old_price_unit'),
+                               old_name=primary.get('old_name'),
+                               old_date_planned=primary.get('old_date_planned'),
+                               extra_po_lines=extras)
+        except Exception as e:
+            logger.exception("Errore create_bozza_autostrade")
+            # Best-effort restore delle POL già aggiornate prima dell'errore
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            return WriteResult(success=False, action='create_draft_autostrade',
+                               error_message=str(e), dry_run=False)
+
+    # === Automezzi (7 fornitori noleggio veicoli) === #
+
+    # Mappa aliquota XML -> tax_id Odoo per fallback (quando il fornitore
+    # non ha override per voce/classificazione).
+    _ALIQUOTA_TO_TAX_DEFAULT = {
+        22.0: 11,    # 22% S
+        10.0: 21,    # 10% S (se mai usato)
+        4.0: 18,     # 4% S
+    }
+
+    @staticmethod
+    def _classify_voce_automezzi(desc: str) -> str:
+        """Identifica voce di una riga XML automezzi.
+
+        Ritorna: 'locazione' | 'servizi' | 'tassa' | 'spese_incasso'.
+        Default 'locazione' (caso più frequente).
+        """
+        d = (desc or '').upper()
+        # Spese di incasso bancarie (Tecnoalt €3.50): conto 420410 oneri bancari
+        if any(tok in d for tok in (
+                'SPESE DI INCASSO', 'SPESE INCASSO', 'SPESE D\'INCASSO')):
+            return 'spese_incasso'
+        # Tassa/bollo prima (più specifico)
+        if any(tok in d for tok in (
+                'BOLLO', 'TASSA DI PROPRIETA', 'TASSA AUTOMOBILISTICA',
+                'RIADDEBITO TASSE', 'SUPERBOLLO', 'TASSA DI POSSESSO')):
+            return 'tassa'
+        # Servizi (specifico)
+        if any(tok in d for tok in (
+                'GESTIONE E SERVIZI', 'CANONE SERVIZIO', 'CANONE SERVIZI',
+                'CANONESERVIZIO')):
+            return 'servizi'
+        # Default = locazione
+        return 'locazione'
+
+    @staticmethod
+    def _pol_product_matches_voce(pol: Dict, voce: str) -> bool:
+        """Decide se una POL libera è adatta per una riga XML di una certa voce.
+
+        Match logic:
+          voce='spese_incasso' -> POL con product_id che contiene 'incasso' o
+            'spese' (es. '[Spese Incasso] Spese Incasso')
+          altre voci -> POL con product_id che NON contiene 'incasso/spese'
+            (es. 'noleggio', 'Fornitura di Servizi', 'PARCHEGGIO')
+        """
+        prod = pol.get('product_id')
+        if not isinstance(prod, list) or len(prod) < 2:
+            return True  # POL senza product_id, accetta come jolly
+        prod_name = (prod[1] or '').lower()
+        is_incasso_pol = any(k in prod_name for k in ('incasso', 'spese'))
+        if voce == 'spese_incasso':
+            return is_incasso_pol
+        return not is_incasso_pol
+
+    @staticmethod
+    def _extract_targa_automezzi(riga, raw_xml_line: str = '') -> str:
+        """Estrae targa da una riga XML.
+
+        Strategia (in ordine di priorita'):
+          1. CodiceArticolo con CodiceTipo='TARGA' (Tecnoalt FatturaPA std)
+          2. AltriDatiGestionali con TipoDato='Targa' (Athlon/UnipolRental)
+          3. Regex sulla descrizione testuale (Leasys/ALD/Arval)
+          4. Regex su raw_xml_line se passato (fallback)
+        """
+        if not riga:
+            return ''
+        # 1. CodiceArticolo TARGA strutturato (Tecnoalt)
+        codici = getattr(riga, 'codici_articolo', None) or {}
+        targa_struct = (codici.get('TARGA') or codici.get('Targa') or
+                         codici.get('targa') or '')
+        if targa_struct:
+            m0 = re.search(r'\b([A-Z]{2}\d{3}[A-Z]{2})\b', str(targa_struct).upper())
+            if m0:
+                return m0.group(1)
+        # 2. AltriDatiGestionali TARGA (Athlon, UnipolRental)
+        adg = getattr(riga, 'altri_dati_gestionali', None) or {}
+        targa_adg = adg.get('TARGA') or adg.get('Targa') or ''
+        if targa_adg:
+            m1 = re.search(r'\b([A-Z]{2}\d{3}[A-Z]{2})\b', str(targa_adg).upper())
+            if m1:
+                return m1.group(1)
+        # 3. Regex sulla descrizione
+        desc = riga.descrizione or ''
+        m = re.search(r'\b([A-Z]{2}\d{3}[A-Z]{2})\b', desc.upper())
+        if m:
+            return m.group(1)
+        # 4. Fallback su raw_xml_line passato
+        if raw_xml_line:
+            m2 = re.search(r'\b([A-Z]{2}\d{3}[A-Z]{2})\b', raw_xml_line.upper())
+            if m2:
+                return m2.group(1)
+        return ''
+
+    @staticmethod
+    def _extract_numero_contratto_unipol(desc: str) -> str:
+        """Per UnipolRental: estrae numero contratto da regex 'Contr. n.NNN'."""
+        if not desc:
+            return ''
+        m = re.search(r'Contr\.?\s*n\.?\s*([\w\d\-]+)', desc, re.IGNORECASE)
+        return m.group(1).strip() if m else ''
+
+    def _resolve_oda_automezzi(self, mapping_entry: Dict, riga,
+                                  numero_contratto_xml: str) -> str:
+        """Risolve OdA target per una riga XML.
+
+        Priorità:
+        1. Se multi_contratto: cerca numero_contratto_xml in
+           mapping_entry['contratti'] -> oda_fisso
+        2. Fallback su mapping_entry['oda_default'] (multi_contratto)
+        3. Per fornitori non multi_contratto: mapping_entry['oda_fisso']
+        """
+        if mapping_entry.get('multi_contratto'):
+            contratti = mapping_entry.get('contratti', {})
+            sub = contratti.get(numero_contratto_xml)
+            if sub:
+                return sub.get('oda_fisso')
+            return mapping_entry.get('oda_default')
+        return mapping_entry.get('oda_fisso')
+
+    def _auto_discover_oda_by_targa(self, partner_id: int, targa: str,
+                                      company_id: int = 1,
+                                      excluded_oda_names: Optional[set] = None) -> Optional[str]:
+        """Auto-discovery OdA aperto del fornitore con POL libere che cita la targa.
+
+        Pattern Tecnoalt-style: 1 OdA per veicolo. Se il numero contratto
+        della fattura non è nella mappatura statica (config/rules.py), cerca
+        tra gli OdA aperti del fornitore quale ha POL libere col `name` che
+        contiene la targa.
+
+        Restituisce il `name` dell'OdA (es. 'P02976') o None se non univoco.
+        """
+        if not partner_id or not targa:
+            return None
+        excluded = excluded_oda_names or set()
+        # Tutti gli OdA aperti (state=purchase) del fornitore
+        pos = self.client._call('purchase.order', 'search_read',
+            [('partner_id', '=', partner_id),
+             ('company_id', '=', company_id),
+             ('state', '=', 'purchase')],
+            fields=['id', 'name'], limit=50)
+        candidates = []
+        for po in pos:
+            if po['name'] in excluded:
+                continue
+            # Cerca POL libere su questo OdA che citano la targa
+            pol_count = self.client._call('purchase.order.line', 'search_count',
+                [('order_id', '=', po['id']),
+                 ('name', 'ilike', targa),
+                 ('qty_invoiced', '=', 0),
+                 ('qty_received', '=', 0)])
+            if pol_count > 0:
+                candidates.append((po['name'], pol_count))
+        if len(candidates) == 1:
+            return candidates[0][0]
+        if len(candidates) > 1:
+            # Più OdA candidati: prendi quello con più POL libere matching
+            candidates.sort(key=lambda x: -x[1])
+            logger.warning(f"Auto-discovery: {len(candidates)} OdA candidati "
+                          f"per targa={targa}, scelto {candidates[0][0]} "
+                          f"(con {candidates[0][1]} POL libere matching)")
+            return candidates[0][0]
+        return None
+
+    def _resolve_classificazione_veicolo(self, targa: str,
+                                           numero_contratto_xml: str,
+                                           mapping_entry: Optional[Dict] = None) -> tuple:
+        """Risolve classificazione fiscale veicolo da PARCO_BY_TARGA / PARCO_BY_CONTRATTO.
+
+        Strategia (in ordine):
+          1. Lookup PARCO_BY_TARGA[targa]
+          2. Lookup PARCO_BY_CONTRATTO[numero]
+          3. Override per fornitore: mapping_entry.classificazione_default
+             (es. Tecnoalt = sempre POOL anche se targa non in parco)
+          4. Default conservativo: uso_promiscuo
+
+        Ritorna (classificazione, source) dove source =
+        'targa' | 'contratto' | 'fornitore_default' | 'default_unknown'.
+        """
+        try:
+            from config.parco_auto_mapping import (
+                get_classificazione_by_targa, get_classificazione_by_contratto)
+        except ImportError:
+            # No parco mapping: applica fornitore_default se c'è
+            if mapping_entry and mapping_entry.get('classificazione_default'):
+                return (mapping_entry['classificazione_default'], 'fornitore_default')
+            return ('uso_promiscuo', 'default_no_mapping')
+        if targa:
+            cls = get_classificazione_by_targa(targa)
+            if cls:
+                return (cls, 'targa')
+        if numero_contratto_xml:
+            cls = get_classificazione_by_contratto(numero_contratto_xml)
+            if cls:
+                return (cls, 'contratto')
+        # 3. Override fornitore (es. Tecnoalt = POOL sempre)
+        if mapping_entry and mapping_entry.get('classificazione_default'):
+            return (mapping_entry['classificazione_default'], 'fornitore_default')
+        return ('uso_promiscuo', 'default_unknown')
+
+    def create_bozza_automezzi(self, analysis,
+                                 mapping_entry: Dict) -> WriteResult:
+        """Crea bozza per fattura noleggio veicoli (7 fornitori automezzi).
+
+        Pattern consume-POL multi-line con riscrittura totale di POL libere
+        generic "TEST €1" pre-create da Acquisti su OdA-ledger annuali (o
+        OdA-per-veicolo per Tecnoalt).
+
+        Per ogni riga XML:
+          1. Identifica voce (locazione/servizi/tassa) via descrizione
+          2. Estrai targa + numero contratto dalla riga
+          3. Lookup PARCO_BY_TARGA/CONTRATTO -> classificazione
+             (POOL/uso_promiscuo/super_lusso). Default uso_promiscuo.
+          4. Conto = CONTO_AUTOMEZZI[(voce, classificazione)]
+          5. Tax_id = TAX_AUTOMEZZI[vat][(voce, classificazione)] con
+             fallback (voce, '*'). Se non trovato, prendi da aliquota_iva XML.
+          6. Risolvi OdA dalla mapping_entry (multi_contratto o singolo)
+          7. Prendi prima POL libera dell'OdA (FIFO id), riscrivi
+             completamente: name, price_unit, taxes_id, qty_received=1
+          8. Crea move_line con purchase_line_id collegato
+
+        Audit con extra_po_lines per N>1 POL consumate (schema esistente
+        extra_po_lines_json).
+
+        Returns WriteResult con po_line_id (1ª POL) + extra_po_lines (2ª-Nª).
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc not in ('TD01', 'TD04'):
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=f"Tipo doc {tipo_doc} non supportato "
+                                             f"per Automezzi (atteso TD01/TD04)",
+                               dry_run=self.dry_run)
+
+        is_nota_credito = (tipo_doc == 'TD04')
+
+        # Risolvo P.IVA fornitore + verifico in mappatura
+        try:
+            from config.rules import (MAPPATURA_AUTOMEZZI, CONTO_AUTOMEZZI,
+                                        TAX_AUTOMEZZI)
+        except ImportError:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="config.rules MAPPATURA_AUTOMEZZI mancante",
+                               dry_run=self.dry_run)
+
+        vat = (analysis.xml_data.cedente_partita_iva or '').strip().upper()
+        if vat not in MAPPATURA_AUTOMEZZI:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=f"P.IVA {vat} non in MAPPATURA_AUTOMEZZI",
+                               dry_run=self.dry_run)
+
+        nome_forn = mapping_entry.get('nome', vat)
+
+        # Righe XML
+        righe = analysis.xml_data.righe or []
+        if not righe:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="Nessuna riga in XML",
+                               dry_run=self.dry_run)
+
+        # Date
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+
+        # Per ogni riga: classifica voce + risolvi OdA + cls + conto + tax
+        # Raggruppa per OdA (alcune fatture toccano più OdA, es. UnipolRental
+        # multi-origin).
+        from config.rules import resolve_mapping_entry
+        # Pre-resolve: per multi_contratto serve un mapping_entry "specifico"
+        # per ogni riga. Per fornitori a OdA singolo basta il parent.
+        is_multi = mapping_entry.get('multi_contratto', False)
+
+        # Per ognuna delle righe, decidiamo info di routing
+        riga_info_list = []
+        for riga in righe:
+            desc = riga.descrizione or ''
+            voce = self._classify_voce_automezzi(desc)
+            targa = self._extract_targa_automezzi(riga)
+            # Numero contratto: per UnipolRental da regex "Contr. n.NNN"
+            # nella desc; per altri si tenta dal contratto_riferimenti XML
+            # (DatiContratto.IdDocumento). Resolve fa già il match
+            # contesto a livello fattura — per riga uso la desc.
+            num_contratto = ''
+            if vat == 'IT03740811207':  # UnipolRental
+                num_contratto = self._extract_numero_contratto_unipol(desc)
+            else:
+                # Per Tecnoalt/ALD/Leasys cerchiamo nei contratto_riferimenti
+                # globali; di solito multi-contratto significa che la fattura
+                # ha N DatiContratto per N righe — il match per riga
+                # richiederebbe RiferimentoNumeroLinea, qui uso il primo
+                # disponibile come fallback.
+                refs = getattr(analysis.xml_data, 'contratto_riferimenti', None) or []
+                if refs:
+                    num_contratto = refs[0].strip()
+
+            # Risolvi OdA per questa riga
+            if is_multi:
+                contratti = mapping_entry.get('contratti', {})
+                sub = contratti.get(num_contratto)
+                if sub:
+                    oda_name = sub.get('oda_fisso')
+                else:
+                    # Auto-discovery: cerca OdA aperto del fornitore con POL
+                    # libere che citano la targa. Pattern Tecnoalt-style
+                    # (1 OdA per veicolo). Funziona anche se il contratto non
+                    # e' in mappatura statica.
+                    oda_name = None
+                    if targa:
+                        oda_name = self._auto_discover_oda_by_targa(
+                            mapping_entry.get('partner_id'),
+                            targa,
+                            company_id=mapping_entry.get('company_id', 1))
+                        if oda_name:
+                            logger.info(f"Auto-discovery OdA: contratto "
+                                       f"{num_contratto} targa={targa} -> "
+                                       f"{oda_name} (non in mappatura statica)")
+                    if not oda_name:
+                        oda_name = mapping_entry.get('oda_default')
+            else:
+                oda_name = mapping_entry.get('oda_fisso')
+
+            if not oda_name:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=(f"OdA non risolto per riga "
+                                                  f"L{riga.numero_linea} fornitore {nome_forn}"),
+                                   dry_run=self.dry_run)
+
+            # Classificazione veicolo (passa mapping_entry per override fornitore_default)
+            cls, cls_source = self._resolve_classificazione_veicolo(
+                targa, num_contratto, mapping_entry=mapping_entry)
+
+            # Conto
+            conto = CONTO_AUTOMEZZI.get((voce, cls))
+            if conto is None:
+                # Fallback: voce + uso_promiscuo
+                conto = CONTO_AUTOMEZZI.get((voce, 'uso_promiscuo'))
+            if conto is None:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=(f"Conto non risolto per "
+                                                  f"voce={voce} cls={cls}"),
+                                   dry_run=self.dry_run)
+
+            # Tax_id: prima da TAX_AUTOMEZZI[vat][(voce, cls)] poi (voce, '*')
+            tax_map = TAX_AUTOMEZZI.get(vat, {})
+            tax_id = tax_map.get((voce, cls)) or tax_map.get((voce, '*'))
+            if tax_id is None:
+                # Fallback su aliquota XML
+                tax_id = self._ALIQUOTA_TO_TAX_DEFAULT.get(
+                    float(riga.aliquota_iva or 0), 11)
+
+            riga_info_list.append({
+                'riga': riga,
+                'voce': voce,
+                'targa': targa,
+                'num_contratto': num_contratto,
+                'cls': cls,
+                'cls_source': cls_source,
+                'oda_name': oda_name,
+                'conto': conto,
+                'tax_id': tax_id,
+            })
+
+        # Raggruppo per OdA
+        oda_to_righe = {}
+        for ri in riga_info_list:
+            oda_to_righe.setdefault(ri['oda_name'], []).append(ri)
+
+        # Recupero info OdA + POL libere per ognuno (1 query per OdA)
+        ECOTEL = 1
+        oda_state = {}   # oda_name -> {po_id, partner_id, currency_id, libere}
+        for oda_name in oda_to_righe.keys():
+            pos = self.client._call('purchase.order', 'search_read',
+                [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+                fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+                limit=1)
+            if not pos:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=f"OdA {oda_name} non trovato su Ecotel",
+                                   dry_run=self.dry_run)
+            po = pos[0]
+            partner_id = (po['partner_id'][0]
+                           if isinstance(po['partner_id'], list) else None)
+            currency_id = (po['currency_id'][0]
+                            if isinstance(po['currency_id'], list) else None)
+            if not partner_id:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=f"OdA {oda_name} senza partner",
+                                   dry_run=self.dry_run)
+            libere = self._find_libere_purchase_order_lines(po['id'], 'standard_qty_inv_rec')
+            n_needed = len(oda_to_righe[oda_name])
+            if len(libere) < n_needed:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=(f"POL libere insufficienti su {oda_name}: "
+                                                  f"{len(libere)} disponibili, {n_needed} servono. "
+                                                  f"Acquisti deve aggiungere altre POL TEST a {oda_name}."),
+                                   dry_run=self.dry_run)
+            oda_state[oda_name] = {
+                'po_id': po['id'],
+                'partner_id': partner_id,
+                'currency_id': currency_id,
+                'libere': libere,
+            }
+
+        # Assegna 1 POL libera per ogni riga: MATCH PER VOCE
+        # (es. riga "Noleggio:" -> POL con product 'noleggio',
+        # riga "SPESE DI INCASSO" -> POL con product '[Spese Incasso]').
+        consumed_pol_info = []
+        move_lines_vals = []
+        # Tracking per OdA: set di POL già consumate in questa fattura
+        oda_pol_used = {oda: set() for oda in oda_to_righe.keys()}
+
+        for ri in riga_info_list:
+            oda_name = ri['oda_name']
+            st = oda_state[oda_name]
+            voce = ri['voce']
+            # Cerca prima POL libera col product matching la voce
+            pol = None
+            for cand in st['libere']:
+                if cand['id'] in oda_pol_used[oda_name]:
+                    continue
+                if self._pol_product_matches_voce(cand, voce):
+                    pol = cand
+                    break
+            # Fallback: se nessuna POL match per voce, prendi la prima libera
+            # disponibile (caso edge: OdA con product_id uniformi)
+            if pol is None:
+                for cand in st['libere']:
+                    if cand['id'] not in oda_pol_used[oda_name]:
+                        pol = cand
+                        break
+            if pol is None:
+                return WriteResult(success=False, action='create_draft_automezzi',
+                                   error_message=(f"POL libere insufficienti su {oda_name} "
+                                                  f"per voce={voce} (fattura ha "
+                                                  f"{len(oda_to_righe[oda_name])} righe)"),
+                                   dry_run=self.dry_run)
+            oda_pol_used[oda_name].add(pol['id'])
+
+            riga = ri['riga']
+            # Importo riga
+            price = float(riga.prezzo_totale or riga.prezzo_unitario or 0)
+            # NC: prezzo negativo
+            if is_nota_credito:
+                price = -abs(price)
+
+            # name allineato al pattern fornitore (preservo desc XML originale)
+            desc_orig = (riga.descrizione or '').strip()
+            new_name = desc_orig if desc_orig else f"{ri['voce']} automezzi"
+            # Aggiungo periodo se presente
+            data_inizio = getattr(riga, 'data_inizio_periodo', None) if hasattr(riga, 'data_inizio_periodo') else None
+            data_fine = getattr(riga, 'data_fine_periodo', None) if hasattr(riga, 'data_fine_periodo') else None
+
+            # Estraggo product/uom dalla POL
+            _prod = pol.get('product_id')
+            product_id = _prod[0] if isinstance(_prod, list) else _prod
+            _uom = pol.get('product_uom')
+            product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+            _aa = pol.get('account_analytic_id')
+            analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+
+            consumed_pol_info.append({
+                'po_line_id': pol['id'],
+                'oda_name': oda_name,
+                'old_price_unit': pol.get('price_unit') or 0,
+                'old_name': pol.get('name') or '',
+                'old_date_planned': pol.get('date_planned') or None,
+                'old_taxes_id': list(pol.get('taxes_id') or []),
+                'voce': ri['voce'],
+                'cls': ri['cls'],
+                'cls_source': ri['cls_source'],
+                'targa': ri['targa'],
+                'num_contratto': ri['num_contratto'],
+                'new_price': round(price, 2),
+                'new_name': new_name,
+                'new_tax_id': ri['tax_id'],
+                'account_id': ri['conto'],
+                'product_id': product_id,
+                'product_uom_id': product_uom_id,
+                'analytic_account_id': analytic_id,
+            })
+            qty_move = -1 if is_nota_credito else 1
+            ml_vals = {
+                'name': new_name,
+                'account_id': ri['conto'],
+                'price_unit': round(price, 2),
+                'quantity': qty_move,
+                'tax_ids': [(6, 0, [ri['tax_id']])],
+                'purchase_line_id': pol['id'],
+            }
+            if product_id:
+                ml_vals['product_id'] = product_id
+            if product_uom_id:
+                ml_vals['product_uom_id'] = product_uom_id
+            if analytic_id:
+                ml_vals['analytic_account_id'] = analytic_id
+            move_lines_vals.append(ml_vals)
+
+        # Move vals (uso il primo OdA come invoice_origin "principale")
+        primary_oda = list(oda_to_righe.keys())[0]
+        primary_partner = oda_state[primary_oda]['partner_id']
+        primary_currency = oda_state[primary_oda]['currency_id']
+        # Se più OdA: invoice_origin elenca tutti separati da virgola
+        all_odas = ','.join(oda_to_righe.keys())
+
+        move_type = 'in_refund' if is_nota_credito else 'in_invoice'
+        journal_id = mapping_entry.get('journal_id', 2)
+        move_vals = {
+            'move_type': move_type,
+            'partner_id': primary_partner,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': all_odas,
+            'journal_id': journal_id,
+            'company_id': ECOTEL,
+            'currency_id': primary_currency,
+            'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
+        }
+
+        if self.dry_run:
+            tot = sum(ml['price_unit'] for ml in move_lines_vals)
+            consumed_str = '; '.join(
+                f"POL {p['po_line_id']} on {p['oda_name']} "
+                f"({p['voce']}/{p['cls']}, EUR{p['old_price_unit']:.2f}->EUR{p['new_price']:.2f}, "
+                f"tax{p['new_tax_id']}, acc{p['account_id']}, targa={p['targa'] or '?'})"
+                for p in consumed_pol_info)
+            logger.info(
+                f"[DRY_RUN] create_bozza_automezzi vat={vat} fornitore={nome_forn} "
+                f"OdA={all_odas} righe={len(move_lines_vals)} "
+                f"consume-POL=[{consumed_str}] "
+                f"tot_imponibile={tot:.2f}")
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['voce']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True, action='create_draft_automezzi',
+                               move_id=None, dry_run=True,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+
+        # === SCRITTURA REALE ===
+        try:
+            for p in consumed_pol_info:
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'taxes_id': [(6, 0, [p['new_tax_id']])],
+                        'product_qty': 1,
+                        'qty_received': 1,
+                        'qty_received_manual': 1,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(f"Updated POL {p['po_line_id']} on {p['oda_name']} "
+                           f"({p['voce']}/{p['cls']}): price={p['new_price']:.2f}")
+
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(f"Created Automezzi move {move_id} vat={vat} OdA={all_odas} "
+                       f"consume-POL ids={[p['po_line_id'] for p in consumed_pol_info]}")
+
+            # Allego XML
+            if analysis.raw_xml:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito: {e}")
+
+            # Marco fatturapa registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito: {e}")
+
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['voce']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True, action='create_draft_automezzi',
+                               move_id=move_id, dry_run=False,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+        except Exception as e:
+            logger.exception("Errore create_bozza_automezzi")
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'taxes_id': [(6, 0, p['old_taxes_id'])],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=str(e), dry_run=False)
+
+    # === Telepass canoni === #
+
+    @staticmethod
+    def _classify_voce_telepass(desc: str) -> str:
+        """Identifica la voce di una riga XML Telepass dalla descrizione.
+
+        Ritorna uno di: 'canone' | 'parcheggio' | 'bollo' | 'quota_associativa'.
+        Default 'canone' (caso più frequente).
+        """
+        d = (desc or '').upper()
+        if 'BOLLO' in d:
+            return 'bollo'
+        if 'QUOTA ASSOCIATIVA' in d:
+            return 'quota_associativa'
+        if 'PARCHEGG' in d:
+            return 'parcheggio'
+        return 'canone'
+
+    def create_bozza_telepass_canoni(self, analysis,
+                                       mapping_entry: Dict) -> WriteResult:
+        """Crea bozza per fattura canoni Telepass S.p.A. (IT09771701001).
+
+        Pattern consume-POL multi-line con riscrittura totale POL "TEST €1
+        generic" pre-create da Acquisti su P03722.
+
+        Per ogni riga XML:
+          1. Identifica voce (canone/parcheggio/bollo/quota_associativa)
+          2. Determina conto contabile dalla mappatura
+             (canone -> 1124, parcheggio -> 368, bollo/quota -> 160/1124)
+          3. Tax_id letto dall'XML (aliquota 22% -> 11, 0% bollo -> 47,
+             0% esente -> 54). Override per voci speciali via lookup.
+          4. Prende prima POL libera P03722 (FIFO id), riscrive
+             completamente: name, price_unit, taxes_id, qty_received=1
+          5. Crea move_line con purchase_line_id collegato
+
+        Rollback: ripristina POL ai valori originali (TEST/€1/tax=11/qty=0)
+        via extra_po_lines_json (schema DB già esistente).
+
+        Returns WriteResult con po_line_id (1ª POL) + extra_po_lines (2ª-Nª).
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc not in ('TD01',):
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message=f"Tipo {tipo_doc} non supportato "
+                                             f"per Telepass canoni (atteso TD01)",
+                               dry_run=self.dry_run)
+
+        cc = getattr(analysis.xml_data, 'codice_cliente', None)
+        if not cc:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message="codice_cliente mancante in XML",
+                               dry_run=self.dry_run)
+
+        cc_type = mapping_entry.get('cc_type')
+        oda_name = mapping_entry.get('oda_fisso')
+        if cc_type != 'telepass_main' or not oda_name:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message=(
+                                   f"mapping_entry incompleto: cc_type={cc_type}, "
+                                   f"oda={oda_name}"),
+                               dry_run=self.dry_run)
+
+        # Cerca OdA P03722 su Ecotel
+        ECOTEL = 1
+        pos = self.client._call('purchase.order', 'search_read',
+            [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+            fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+            limit=1)
+        if not pos:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message=f"OdA {oda_name} non trovato su Ecotel",
+                               dry_run=self.dry_run)
+        po = pos[0]
+        po_id = po['id']
+        po_name = po['name']
+        partner_id = (po['partner_id'][0]
+                       if isinstance(po['partner_id'], list) else None)
+        currency_id = (po['currency_id'][0]
+                        if isinstance(po['currency_id'], list) else None)
+        if not partner_id:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message=f"OdA {oda_name} senza partner",
+                               dry_run=self.dry_run)
+
+        # Righe XML
+        righe = analysis.xml_data.righe or []
+        if not righe:
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message="Nessuna riga in XML",
+                               dry_run=self.dry_run)
+
+        # Date
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+
+        # Conti dalla mappatura
+        conto_canone = mapping_entry.get('conto_canone_id', 1124)
+        conto_parcheggio = mapping_entry.get('conto_parcheggio_id', 368)
+        conto_bollo = mapping_entry.get('conto_bollo_id', 160)
+        # Map voce -> (conto, tax_default)
+        # tax_default: usato come fallback se aliquota XML è 0 e voce
+        # determina tax specifico (bollo->47, quota_associativa->54)
+        VOCE_TO_CONTO = {
+            'canone':            conto_canone,
+            'parcheggio':        conto_parcheggio,
+            'bollo':             conto_bollo,
+            'quota_associativa': conto_canone,
+        }
+        VOCE_TO_TAX_FALLBACK = {
+            'bollo':             47,    # N1 escluse art.15
+            'quota_associativa': 54,    # N4 esenti
+        }
+
+        # Mappa aliquota XML -> tax_id Odoo (le 3 più comuni Telepass)
+        ALIQUOTA_TO_TAX = {
+            22.0: 11,    # 22% S
+        }
+
+        # Recupero TUTTE le POL libere di P03722 (criterio standard)
+        libere = self._find_libere_purchase_order_lines(po_id, 'standard_qty_inv_rec')
+        if len(libere) < len(righe):
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
+                               error_message=(
+                                   f"POL libere insufficienti su {po_name}: "
+                                   f"{len(libere)} disponibili, {len(righe)} servono. "
+                                   f"Acquisti deve aggiungere altre POL TEST a {po_name}."),
+                               dry_run=self.dry_run)
+
+        # Prendo le prime N (FIFO id). Le libere sono già ordinate per
+        # (price_unit ascending, id) → buona priorità.
+        consumed_pol_info: List[Dict] = []
+        move_lines_vals: List[Dict] = []
+        for idx, riga in enumerate(righe):
+            pol = libere[idx]
+            voce = self._classify_voce_telepass(riga.descrizione)
+            conto = VOCE_TO_CONTO[voce]
+            # Tax_id: prima da aliquota XML, poi fallback per voci speciali
+            tax_id = ALIQUOTA_TO_TAX.get(float(riga.aliquota_iva or 0))
+            if tax_id is None:
+                tax_id = VOCE_TO_TAX_FALLBACK.get(voce, 11)
+
+            # Costruzione name 3-righe pattern utenti (verificato gen-mar 2026)
+            # Voci cc-specific (canone/parcheggio): include "Codice cliente: <CC>"
+            # Voci globali (bollo/quota_associativa): solo voce su 1 riga.
+            desc_orig = (riga.descrizione or '').strip()
+            if voce in ('bollo', 'quota_associativa'):
+                new_name = desc_orig or voce.upper()
+            else:
+                new_name = f"{desc_orig}\nCodice cliente: {cc}"
+
+            # Estraggo product/uom dalla POL (necessari per move_line via XML-RPC)
+            _prod = pol.get('product_id')
+            product_id = _prod[0] if isinstance(_prod, list) else _prod
+            _uom = pol.get('product_uom')
+            product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+            _aa = pol.get('account_analytic_id')
+            analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+
+            # Importo: prefer prezzo_totale (con sconti applicati) altrimenti
+            # quantita * prezzo_unitario. Per Telepass canoni qty è sempre 1.
+            price = float(riga.prezzo_totale or riga.prezzo_unitario or 0)
+
+            consumed_pol_info.append({
+                'po_line_id': pol['id'],
+                'old_price_unit': pol.get('price_unit') or 0,
+                'old_name': pol.get('name') or '',
+                'old_date_planned': pol.get('date_planned') or None,
+                'old_taxes_id': list(pol.get('taxes_id') or []),
+                'voce': voce,
+                'cls': voce,  # alias per coerenza con Autostrade extra_po_lines
+                'new_price': round(price, 2),
+                'new_name': new_name,
+                'new_tax_id': tax_id,
+                'account_id': conto,
+                'product_id': product_id,
+                'product_uom_id': product_uom_id,
+                'analytic_account_id': analytic_id,
+            })
+            ml_vals = {
+                'name': new_name,
+                'account_id': conto,
+                'price_unit': round(price, 2),
+                'quantity': 1,
+                'tax_ids': [(6, 0, [tax_id])],
+                'purchase_line_id': pol['id'],
+            }
+            if product_id:
+                ml_vals['product_id'] = product_id
+            if product_uom_id:
+                ml_vals['product_uom_id'] = product_uom_id
+            if analytic_id:
+                ml_vals['analytic_account_id'] = analytic_id
+            move_lines_vals.append(ml_vals)
+
+        # Vals move
+        journal_id = mapping_entry.get('journal_id', 2)
+        move_vals = {
+            'move_type': 'in_invoice',
+            'partner_id': partner_id,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': po_name,
+            'journal_id': journal_id,
+            'company_id': ECOTEL,
+            'currency_id': currency_id,
+            'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
+        }
+
+        if self.dry_run:
+            tot = sum(ml['price_unit'] for ml in move_lines_vals)
+            consumed_str = ', '.join(
+                f"POL {p['po_line_id']} ({p['voce']}, "
+                f"€{p['old_price_unit']:.2f}->€{p['new_price']:.2f}, tx{p['new_tax_id']}, acc{p['account_id']})"
+                for p in consumed_pol_info)
+            logger.info(
+                f"[DRY_RUN] create_bozza_telepass_canoni cc={cc} "
+                f"OdA={po_name} righe={len(move_lines_vals)} "
+                f"consume-POL=[{consumed_str}] "
+                f"tot_imponibile={tot:.2f}")
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'cls': p['voce']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True,
+                               action='create_draft_telepass_canoni',
+                               move_id=None, dry_run=True,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+
+        # === SCRITTURA REALE ===
+        try:
+            # Step 1: aggiorno tutte le POL consumate
+            for p in consumed_pol_info:
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'taxes_id': [(6, 0, [p['new_tax_id']])],
+                        'product_qty': 1,
+                        'qty_received': 1,
+                        'qty_received_manual': 1,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(f"Updated POL {p['po_line_id']} ({p['voce']}): "
+                           f"price={p['new_price']:.2f}, tax={p['new_tax_id']}")
+
+            # Step 2: creo account.move
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(f"Created Telepass move {move_id} cc={cc} OdA={po_name} "
+                       f"consume-POL ids={[p['po_line_id'] for p in consumed_pol_info]}")
+
+            # Allego XML al move
+            if analysis.raw_xml:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito (non blocca): {e}")
+
+            # Marco fatturapa.attachment.in registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito (non blocca): {e}")
+
+            # Audit
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'cls': p['voce']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True,
+                               action='create_draft_telepass_canoni',
+                               move_id=move_id, dry_run=False,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+        except Exception as e:
+            logger.exception("Errore create_bozza_telepass_canoni")
+            # Best-effort restore POL già aggiornate
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'taxes_id': [(6, 0, p['old_taxes_id'])],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            return WriteResult(success=False,
+                               action='create_draft_telepass_canoni',
                                error_message=str(e), dry_run=False)
 
     # === Rollback === #
@@ -1699,20 +3445,30 @@ class OdooWriter:
                         old_price_unit: Optional[float] = None,
                         old_name: Optional[str] = None,
                         old_date_planned: Optional[str] = None,
-                        attachment_id: Optional[int] = None) -> WriteResult:
+                        attachment_id: Optional[int] = None,
+                        added_po_line_ids: Optional[List[int]] = None,
+                        extra_po_lines: Optional[List[Dict]] = None) -> WriteResult:
         """
         Rollback di una bozza creata:
         1. Verifica che il move sia ancora in stato 'draft' (non cancella fatture posted!)
         2. Cancella il account.move
-        3. Ripristina la purchase.order.line aggiornata al vecchio stato
+        3. Ripristina la purchase.order.line PRIMARIA al vecchio stato
            (prezzo, nome, data consegna, qty_received)
-        4. Se attachment_id passato, lo de-registra (registered=False)
+        4. Se passate extra_po_lines (consume-POL multi: Autostrade): ripristina
+           anche le POL secondarie consumate al loro vecchio stato
+           (price_unit/name/date_planned/qty_received).
+        5. Se passate added_po_line_ids: rimuove le POL extra aggiunte all'OdA
+           dal pattern MATCH_PARZIALE_OK + accessorie (spese trasporto/bolli).
+        6. Se attachment_id passato, lo de-registra (registered=False)
            per riportare la fattura nel contenitore "e-fatture in ingresso"
 
         Rifiuta rollback su fatture posted per sicurezza.
         """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] rollback_bozza move_id={move_id}, po_line={po_line_id}")
+            extra_ids = [p.get('po_line_id') for p in (extra_po_lines or [])]
+            logger.info(f"[DRY_RUN] rollback_bozza move_id={move_id}, "
+                       f"po_line={po_line_id}, extra_pol={extra_ids}, "
+                       f"added_pol={added_po_line_ids}")
             return WriteResult(success=True, action='rollback',
                                move_id=move_id, po_line_id=po_line_id,
                                dry_run=True)
@@ -1736,6 +3492,55 @@ class OdooWriter:
             self.client._call('account.move', 'unlink', [move_id])
             logger.info(f"Deleted account.move {move_id}")
 
+            # Pulisco le POL extra aggiunte all'OdA in fase di create
+            # (pattern MATCH_PARZIALE_OK + righe accessorie).
+            # Strategia: prima tento unlink (funziona solo se OdA in draft);
+            # se fallisce per stato purchase, annullo la riga (qty=0,
+            # price=0, prefisso "[ANNULLATA]" nel nome). La POL rimane
+            # visibile ma non incide sui totali OdA.
+            if added_po_line_ids:
+                # Recupero stato attuale (alcune potrebbero essere già
+                # state rimosse, o l'OdA potrebbe essere già diverso)
+                try:
+                    existing_data = self.client._call(
+                        'purchase.order.line', 'search_read',
+                        [('id', 'in', list(added_po_line_ids))],
+                        fields=['id', 'name'])
+                except Exception as e:
+                    logger.warning(f"Lettura POL extra {added_po_line_ids} "
+                                   f"fallita (non blocca rollback): {e}")
+                    existing_data = []
+
+                for pol in existing_data:
+                    pol_id = pol['id']
+                    orig_name = pol.get('name', '')
+                    try:
+                        # Tento unlink (passa solo se OdA in draft)
+                        self.client._call('purchase.order.line', 'unlink',
+                                          [pol_id])
+                        logger.info(f"Removed extra POL id={pol_id} "
+                                   f"from OdA (rollback)")
+                    except Exception:
+                        # Fallback: azzero la POL (qty=0, price=0)
+                        try:
+                            new_name = orig_name
+                            if not new_name.startswith('[ANNULLATA]'):
+                                new_name = f"[ANNULLATA] {orig_name}"
+                            self.client._call('purchase.order.line', 'write',
+                                [pol_id], {
+                                    'product_qty': 0,
+                                    'price_unit': 0,
+                                    'qty_received': 0,
+                                    'qty_received_manual': 0,
+                                    'name': new_name,
+                                })
+                            logger.info(f"Cancellata logicamente extra POL "
+                                       f"id={pol_id} (qty=0, price=0, "
+                                       f"prefix [ANNULLATA])")
+                        except Exception as e2:
+                            logger.warning(f"Azzeramento POL {pol_id} fallito "
+                                           f"(non blocca rollback): {e2}")
+
             # De-registro l'attachment fatturapa (lo riporta nel contenitore
             # "e-fatture in ingresso")
             if attachment_id:
@@ -1746,27 +3551,80 @@ class OdooWriter:
                 except Exception as e:
                     logger.warning(f"De-registrazione attachment fallita (non blocca): {e}")
 
-            # Ripristino la riga OdA se richiesto. Ripristino SEMPRE anche
-            # qty_received=0 / qty_received_manual=0 per liberare la riga
-            # completamente (anche se old values non lo specificano).
+            # Ripristino la riga OdA se richiesto.
+            # IMPORTANTE: qty_received va azzerato SOLO per servizi
+            # (POL ledger di Trenitalia/Italo o servizi su OdA matchato).
+            # Per le MERCI, qty_received riflette la ricezione magazzino reale
+            # e NON va toccato dal rollback (altrimenti scolleghiamo la merce
+            # ricevuta dalla picking di magazzino → bug visto su CEML5-M).
             if po_line_id:
-                write_vals = {
-                    'qty_received': 0,
-                    'qty_received_manual': 0,
-                }
+                # Leggo tipo prodotto della POL per decidere
+                prod_type = 'service'  # default conservativo
+                try:
+                    pol_data = self.client._call(
+                        'purchase.order.line', 'read', [po_line_id],
+                        fields=['id', 'product_id'])
+                    if pol_data:
+                        prod = pol_data[0].get('product_id')
+                        prod_id = prod[0] if isinstance(prod, list) and prod else None
+                        if prod_id:
+                            prods = self.client._call(
+                                'product.product', 'read', [prod_id],
+                                fields=['id', 'type'])
+                            if prods:
+                                prod_type = prods[0].get('type') or 'service'
+                except Exception as e:
+                    logger.warning(f"Impossibile leggere tipo prodotto POL "
+                                   f"{po_line_id}, fallback service: {e}")
+
+                write_vals = {}
+                if prod_type == 'service':
+                    # Azzero qty_received per liberare la riga ledger
+                    write_vals['qty_received'] = 0
+                    write_vals['qty_received_manual'] = 0
+                else:
+                    # Merci: NON tocco qty_received (è gestito dal magazzino)
+                    logger.info(f"PO line {po_line_id} è merce (type={prod_type}): "
+                               f"qty_received NON azzerato dal rollback")
+
                 if old_price_unit is not None:
                     write_vals['price_unit'] = old_price_unit
                 if old_name is not None:
                     write_vals['name'] = old_name
                 if old_date_planned:
                     write_vals['date_planned'] = old_date_planned
-                # write con 2 args posizionali: [ids] e dict vals
-                self.client._call('purchase.order.line', 'write',
-                    [po_line_id], write_vals)
-                logger.info(f"Restored PO line {po_line_id}: "
-                           f"price={old_price_unit}, name='{old_name}', "
-                           f"date_planned={old_date_planned}, "
-                           f"qty_received=0")
+
+                if write_vals:
+                    self.client._call('purchase.order.line', 'write',
+                        [po_line_id], write_vals)
+                    logger.info(f"Restored PO line {po_line_id} (type={prod_type}): "
+                               f"vals={list(write_vals.keys())}")
+
+            # Ripristino POL secondarie consumate (consume-POL multi:
+            # Autostrade ecotel_main consuma 2 POL per fattura).
+            if extra_po_lines:
+                for ext in extra_po_lines:
+                    ext_id = ext.get('po_line_id')
+                    if not ext_id:
+                        continue
+                    ext_vals = {
+                        'qty_received': 0,
+                        'qty_received_manual': 0,
+                    }
+                    if ext.get('old_price_unit') is not None:
+                        ext_vals['price_unit'] = ext['old_price_unit']
+                    if ext.get('old_name') is not None:
+                        ext_vals['name'] = ext['old_name']
+                    if ext.get('old_date_planned'):
+                        ext_vals['date_planned'] = ext['old_date_planned']
+                    try:
+                        self.client._call('purchase.order.line', 'write',
+                            [ext_id], ext_vals)
+                        logger.info(f"Restored extra PO line {ext_id} "
+                                   f"({ext.get('cls','')}): "
+                                   f"vals={list(ext_vals.keys())}")
+                    except Exception as e:
+                        logger.warning(f"Restore extra POL {ext_id} fallito: {e}")
 
             return WriteResult(success=True, action='rollback',
                                move_id=move_id, po_line_id=po_line_id)
@@ -1815,10 +3673,28 @@ class OdooWriter:
             return WriteResult(success=True, action='restore_line',
                                po_line_id=po_line_id, dry_run=True)
         try:
-            write_vals = {
-                'qty_received': 0,
-                'qty_received_manual': 0,
-            }
+            # Determino tipo prodotto per decidere se azzerare qty_received
+            # (solo per servizi/POL ledger, mai per merci ricevute in magazzino)
+            prod_type = 'service'  # default conservativo
+            try:
+                pol_data = self.client._call(
+                    'purchase.order.line', 'read', [po_line_id],
+                    fields=['id', 'product_id'])
+                if pol_data:
+                    prod = pol_data[0].get('product_id')
+                    prod_id = prod[0] if isinstance(prod, list) and prod else None
+                    if prod_id:
+                        prods = self.client._call('product.product', 'read',
+                            [prod_id], fields=['id', 'type'])
+                        if prods:
+                            prod_type = prods[0].get('type') or 'service'
+            except Exception:
+                pass
+
+            write_vals = {}
+            if prod_type == 'service':
+                write_vals['qty_received'] = 0
+                write_vals['qty_received_manual'] = 0
             if old_price_unit is not None:
                 write_vals['price_unit'] = old_price_unit
             else:
@@ -2040,7 +3916,8 @@ class OdooWriter:
             return WriteResult(success=False, action='create_draft_libera',
                                error_message="data fattura mancante",
                                dry_run=self.dry_run)
-        data_competenza = self._end_of_month(invoice_date)
+        data_contabile = self._data_contabile(analysis, invoice_date)
+        data_competenza_iva = self._end_of_month(invoice_date)
         invoice_number = analysis.xml_data.numero or ''
         oda_name = po.get('name') or ''
 
@@ -2110,8 +3987,8 @@ class OdooWriter:
             'partner_id': partner_id,
             'move_type': move_type,
             'invoice_date': invoice_date,
-            'date': data_competenza,
-            'l10n_it_vat_settlement_date': data_competenza,
+            'date': data_contabile,
+            'l10n_it_vat_settlement_date': data_competenza_iva,
             'ref': invoice_number,
             'invoice_origin': oda_name,
             'journal_id': journal_id,
