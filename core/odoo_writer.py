@@ -1901,7 +1901,7 @@ class OdooWriter:
         # creeremo una riga "spese accessorie" col delta sotto.
         if diff > tolerance and not (
                 analysis.classification == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA'
-                and is_subset_match):
+                and is_subset_suggested):
             self._cleanup_extra_pols(added_po_line_ids)
             return WriteResult(
                 success=False, action='create_draft_from_oda',
@@ -2092,10 +2092,10 @@ class OdooWriter:
                        f"imponibile fattura €{imponibile_xml:.2f} ≈ somma righe €{sum_billable:.2f}")
             for tup in move_line_vals:
                 _, _, ml = tup
-                logger.info(f"  ML: pl_id={ml['purchase_line_id']} "
-                           f"acc={ml['account_id']} qty={ml['quantity']:.2f} "
-                           f"pu={ml['price_unit']:.2f} tax={ml['tax_ids']} "
-                           f"name={ml['name'][:60]!r}")
+                logger.info(f"  ML: pl_id={ml.get('purchase_line_id')} "
+                           f"acc={ml.get('account_id')} qty={ml.get('quantity',0):.2f} "
+                           f"pu={ml.get('price_unit',0):.2f} tax={ml.get('tax_ids')} "
+                           f"name={(ml.get('name') or '')[:60]!r}")
             return WriteResult(
                 success=True, action='create_draft_from_oda',
                 move_id=None, po_line_id=primary_po_line_id,
