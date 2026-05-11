@@ -1033,6 +1033,50 @@ class OdooWriter:
         # 5. Calcolo price_unit; subtotal stimato = amount (entra nei controlli totale)
         price_unit = amount / quantita if quantita > 0 else amount
 
+        # 5b. PRIMA di creare una POL nuova, cerca sull'OdA una POL libera
+        # coerente (stesso product accessorio, qty_invoiced=0, price_subtotal
+        # ~ amount, non gia' annullata). Replica il pattern operatore: se la
+        # riga e' gia' lì pronta, la consumiamo invece di crearne una nuova.
+        # Evita il bug "POL trasporto duplicata" (RemaTarlazzi V6/2026/41121
+        # e altri): senza questo passaggio _add_extra_pol_to_oda creava sempre
+        # una POL nuova e raddoppiava il billing rispetto alla POL libera
+        # esistente, facendo fallire il check totale con "Discrepanza".
+        try:
+            tol_abs = max(0.01, abs(amount) * 0.01)
+            candidates = self.client._call(
+                'purchase.order.line', 'search_read',
+                [('order_id', '=', po_id),
+                 ('product_id', '=', product_id),
+                 ('qty_invoiced', '=', 0)],
+                fields=['id', 'name', 'product_id', 'product_qty',
+                        'product_uom', 'price_unit', 'price_subtotal',
+                        'discount', 'qty_received', 'qty_received_manual',
+                        'qty_invoiced', 'taxes_id', 'account_analytic_id',
+                        'sequence'])
+            reused = None
+            for c in candidates:
+                cname = (c.get('name') or '').strip()
+                if cname.upper().startswith('[ANNULLATA]'):
+                    continue
+                csub = float(c.get('price_subtotal') or 0)
+                if abs(csub - amount) <= tol_abs:
+                    reused = c
+                    break
+            if reused is not None:
+                logger.info(
+                    f"Riuso POL libera esistente id={reused['id']} "
+                    f"cat={categoria} po_id={po_id} desc='{desc[:60]}' "
+                    f"amount=EUR {amount:.2f} (price_subtotal POL "
+                    f"EUR {float(reused.get('price_subtotal') or 0):.2f})")
+                reused['_account_id_override'] = account_id_override
+                reused['_extra_categoria'] = categoria
+                reused['_reused_existing'] = True
+                return reused
+        except Exception as e:
+            # Non bloccante: se la search fallisce per qualsiasi motivo,
+            # ricado nel comportamento legacy (creo POL nuova).
+            logger.warning(f"Lookup POL libera fallito (procedo a create): {e}")
+
         vals = {
             'order_id': po_id,
             'name': desc,
@@ -1573,7 +1617,7 @@ class OdooWriter:
             po_line_ids_all,
             fields=['id', 'name', 'product_id', 'product_uom', 'taxes_id',
                     'qty_received', 'qty_received_manual', 'qty_invoiced',
-                    'product_qty', 'price_unit', 'price_subtotal',
+                    'product_qty', 'price_unit', 'price_subtotal', 'discount',
                     'account_analytic_id', 'sequence'])
         # Ordino per sequence per riprodurre l'ordine UI
         po_lines_data.sort(key=lambda l: (l.get('sequence') or 0, l['id']))
@@ -1666,10 +1710,22 @@ class OdooWriter:
                             f"Riga extra oltre soglia €{ADD_EXTRA_POL_MAX_AMOUNT:.2f}: "
                             f"'{extra_desc[:60]}' (€{extra_amount:.2f})"),
                         dry_run=self.dry_run)
-                # Aggiungo la nuova POL al pool da fatturare
-                po_lines_data.append(new_pol)
-                if new_pol.get('id'):
-                    added_po_line_ids.append(new_pol['id'])
+                if new_pol.get('_reused_existing'):
+                    # POL libera gia' presente sull'OdA: NON va aggiunta in
+                    # po_lines_data (lo e' gia') e NON va registrata in
+                    # added_po_line_ids (sarebbe annullata dal cleanup in
+                    # caso di fail successivo). Setto solo l'override conto
+                    # sulla POL gia' presente.
+                    for i, pl in enumerate(po_lines_data):
+                        if pl.get('id') == new_pol.get('id'):
+                            pl['_account_id_override'] = new_pol.get('_account_id_override')
+                            pl['_extra_categoria'] = new_pol.get('_extra_categoria')
+                            break
+                else:
+                    # Aggiungo la nuova POL al pool da fatturare
+                    po_lines_data.append(new_pol)
+                    if new_pol.get('id'):
+                        added_po_line_ids.append(new_pol['id'])
             if added_po_line_ids:
                 logger.info(
                     f"Aggiunte {len(added_po_line_ids)} POL extra all'OdA "
@@ -1827,7 +1883,15 @@ class OdooWriter:
                                dry_run=self.dry_run)
 
         # --- Verifica totale: somma billable_lines ≈ imponibile fattura XML ---
-        sum_billable = sum(qty * float(pl.get('price_unit') or 0)
+        # Usa discount della POL (in %): subtotal = qty * price_unit * (1 - discount/100).
+        # Necessario per OdA con sconto: senza questo, qty*price_unit > price_subtotal
+        # reale e il check sballerebbe (es. IC Intracom 600x2.70 con discount 3% =
+        # 1571.40 effettivi, non 1620 nominali).
+        def _line_billable_amount(pl, qty):
+            pu = float(pl.get('price_unit') or 0)
+            disc = float(pl.get('discount') or 0)
+            return qty * pu * (1.0 - disc / 100.0)
+        sum_billable = sum(_line_billable_amount(pl, qty)
                           for pl, qty, _, _ in billable_lines)
         imponibile_xml = float(analysis.xml_data.imponibile_totale or 0)
         diff = abs(sum_billable - imponibile_xml)
@@ -1900,6 +1964,11 @@ class OdooWriter:
                 'tax_ids': [(6, 0, tax_ids)] if tax_ids else [(6, 0, [])],
                 'purchase_line_id': pl['id'],
             }
+            # Propaga discount POL al move_line: il subtotale fattura applica
+            # lo stesso sconto della POL (es. IC Intracom OdA al -3%).
+            pol_discount = float(pl.get('discount') or 0)
+            if pol_discount:
+                ml_vals['discount'] = pol_discount
             if isinstance(prod, list):
                 ml_vals['product_id'] = prod[0]
             uom = pl.get('product_uom')
