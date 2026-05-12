@@ -1,0 +1,16 @@
+
+
+fornitori LEASYS, UNIPOL RENTAL, ARVAL, ALD AUTOMOTIVE, ATHLON, TECNOALT
+
+Per le fatture relative alle spese di Riaddebito Tassa Automobilistica Regionale, il conto da utilizzare è:
+•	490410 tassa di possesso automezzi deducibili al 70% se mezzo ad uso promiscuo altrimenti
+•	490300 tassa di possesso automezzi deducibili al 100%
+
+
+
+Per le fatture relative alle spese di notifica della gestione delle multe, il conto da utilizzare è:
+•	430240 servizi su locazioni automezzi deducibili al 70% se mezzo ad uso promiscuo altrimenti
+•	430230 servizi su locazioni automezzi deducibili al 100% 
+
+
+

@@ -10,6 +10,7 @@ Poi apri il browser all'indirizzo:
 """
 
 import os
+import re
 import sys
 import json
 import sqlite3
@@ -125,7 +126,8 @@ def init_db():
                 'no_oda_con_suggerimenti',
                 'match_da_suggerimento',
                 'match_da_suggerimento_extra',
-                'mappatura_fornitore']:
+                'mappatura_fornitore',
+                'mappatura_automezzi']:
         if col not in existing_cols:
             c.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER DEFAULT 0")
 
@@ -184,6 +186,36 @@ def init_db():
         c.execute("ALTER TABLE odoo_writes ADD COLUMN old_date_planned TEXT")
     except sqlite3.OperationalError:
         pass  # colonna già esistente
+    # Migrazione: added_po_line_ids per tracciare POL extra aggiunte
+    # (pattern operatore MATCH_PARZIALE_OK + spese accessorie). CSV di IDs
+    # pertinenti al rollback, NULL se non rilevante.
+    try:
+        c.execute("ALTER TABLE odoo_writes ADD COLUMN added_po_line_ids TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # Migrazione: extra_po_lines_json per consume-POL multi (Autostrade
+    # consuma 2 POL per fattura: furgoni + uso_promiscuo). JSON list di dict
+    # {po_line_id, old_price_unit, old_name, old_date_planned, cls}. NULL
+    # se non applicabile.
+    try:
+        c.execute("ALTER TABLE odoo_writes ADD COLUMN extra_po_lines_json TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # Migrazione: PDF split per fatture Autostrade (R4 split Furgoni/Promiscuo)
+    # pdf_path: percorso file PDF caricato dall'utente
+    # pdf_split_furgoni: imponibile attribuito a 420160 (Furgoni 100%)
+    # pdf_split_promiscuo: imponibile attribuito a 420840 (Uso Promiscuo 70%)
+    # pdf_split_warnings: JSON list di warnings (apparati non mappati ecc.)
+    for col, ddl in (
+        ("pdf_path", "TEXT"),
+        ("pdf_split_furgoni", "REAL"),
+        ("pdf_split_promiscuo", "REAL"),
+        ("pdf_split_warnings", "TEXT"),
+    ):
+        try:
+            c.execute(f"ALTER TABLE analyses ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError:
+            pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_writes_analysis ON odoo_writes(analysis_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_writes_move ON odoo_writes(move_id)")
 
@@ -324,7 +356,7 @@ def run_agent_async(limit=None):
             da_verificare=?, cumul_eccede=?, oda_non_trovato=?,
             no_oda=?, no_oda_con_suggerimenti=?, match_da_suggerimento=?,
             match_da_suggerimento_extra=?,
-            mappatura_fornitore=?,
+            mappatura_fornitore=?, mappatura_automezzi=?,
             commesse=?, anomalie=?, total_amount=?
             WHERE id=?
         """, (
@@ -344,6 +376,7 @@ def run_agent_async(limit=None):
             counts.get('MATCH_DA_SUGGERIMENTO', 0),
             counts.get('MATCH_DA_SUGGERIMENTO_PIU_EXTRA', 0),
             counts.get('MAPPATURA_FORNITORE_FISSO', 0),
+            counts.get('MAPPATURA_AUTOMEZZI', 0),
             counts.get('COMMESSA_DETECTED', 0),
             counts.get('ANOMALIA', 0),
             sum(a.invoice_total for a in analyses),
@@ -547,6 +580,38 @@ def settings():
                            tol_total=TOLLERANZA_TOTALE_FATTURA)
 
 
+@app.route('/api/run/<int:run_id>/analyses')
+def api_run_analyses_list(run_id):
+    """Lista analisi di una run, opzionalmente filtrate per classification.
+
+    Usato dal bulk JS Automezzi per recuperare gli id delle analisi della
+    categoria.
+    """
+    classification = request.args.get('classification')
+    conn = get_db()
+    try:
+        if classification:
+            rows = conn.execute(
+                "SELECT id, supplier_vat, supplier_name, invoice_number, "
+                "invoice_total, classification "
+                "FROM analyses WHERE run_id=? AND classification=? "
+                "ORDER BY id",
+                (run_id, classification)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, supplier_vat, supplier_name, invoice_number, "
+                "invoice_total, classification "
+                "FROM analyses WHERE run_id=? ORDER BY id",
+                (run_id,)).fetchall()
+        return jsonify({
+            'run_id': run_id,
+            'classification': classification,
+            'analyses': [dict(r) for r in rows],
+        })
+    finally:
+        conn.close()
+
+
 @app.route('/api/export/<int:run_id>/<string:category>')
 def api_export(run_id, category):
     """Esporta CSV delle fatture di una categoria specifica."""
@@ -603,10 +668,12 @@ def _load_analysis_for_write(conn, analysis_id: int) -> Optional[Any]:
     )
     client.connect()
 
-    # Rileggo l'attachment fresco dall'Odoo per avere XML aggiornato
+    # Rileggo l'attachment fresco dall'Odoo per avere XML aggiornato.
+    # `create_date` necessario per popolare la data contabile (data ricezione
+    # SdI) sulle bozze - vedi OdooWriter._data_contabile.
     atts = client._call('fatturapa.attachment.in', 'search_read',
         [('id', '=', row['attachment_id'])],
-        fields=['id', 'name', 'datas', 'xml_supplier_id'])
+        fields=['id', 'name', 'datas', 'xml_supplier_id', 'create_date'])
     if not atts:
         return None, client
     att = atts[0]
@@ -614,6 +681,7 @@ def _load_analysis_for_write(conn, analysis_id: int) -> Optional[Any]:
     # Ricreo l'analisi minima per il writer
     a = FatturaPAAnalysis(attachment_id=row['attachment_id'])
     a.attachment_name = att.get('name', '')
+    a.attachment_create_date = str(att.get('create_date') or '')
     a.xml_data = parse_from_base64(att['datas'])
     try:
         a.raw_xml = _b64.b64decode(att['datas']).decode('utf-8', errors='replace')
@@ -728,10 +796,18 @@ def api_odoo_rollback(analysis_id):
 
     conn = get_db()
     try:
-        # Trova la scrittura da rollbackare (sia create_draft che create_draft_from_oda)
+        # Trova la scrittura da rollbackare. Whitelist:
+        # - create_draft: writer Trenitalia/Italo (consume 1 POL ledger)
+        # - create_draft_from_oda: writer AUTO_VALIDABILE
+        # - create_draft_libera: writer NO_ODA libera (storico)
+        # - create_draft_autostrade: writer Autostrade consume-POL (2 POL)
+        # - create_draft_telepass_canoni: writer Telepass canoni consume-POL multi
         write_row = conn.execute("""
             SELECT * FROM odoo_writes
-            WHERE analysis_id=? AND action IN ('create_draft','create_draft_from_oda','create_draft_libera')
+            WHERE analysis_id=? AND action IN
+                ('create_draft','create_draft_from_oda','create_draft_libera',
+                 'create_draft_autostrade','create_draft_telepass_canoni',
+                 'create_draft_automezzi')
               AND success=1 AND dry_run=0
               AND NOT EXISTS (
                   SELECT 1 FROM odoo_writes ow2
@@ -761,6 +837,25 @@ def api_odoo_rollback(analysis_id):
         except (IndexError, KeyError):
             old_date_planned = None
 
+        # POL extra aggiunte all'OdA in fase di create (pattern operatore
+        # MATCH_PARZIALE_OK + accessorie). Rimuove anche queste in rollback.
+        added_po_line_ids = None
+        try:
+            csv = write_row['added_po_line_ids']
+            if csv:
+                added_po_line_ids = [int(x) for x in csv.split(',') if x.strip()]
+        except (IndexError, KeyError, TypeError, ValueError):
+            added_po_line_ids = None
+
+        # POL secondarie consumate (consume-POL multi: Autostrade ne consuma 2)
+        extra_po_lines = None
+        try:
+            extra_json = write_row['extra_po_lines_json']
+            if extra_json:
+                extra_po_lines = json.loads(extra_json)
+        except (IndexError, KeyError, TypeError, ValueError):
+            extra_po_lines = None
+
         result = writer.rollback_bozza(
             move_id=write_row['move_id'],
             po_line_id=write_row['po_line_id'],
@@ -768,6 +863,8 @@ def api_odoo_rollback(analysis_id):
             old_name=write_row['old_name'],
             old_date_planned=old_date_planned,
             attachment_id=attachment_id,
+            added_po_line_ids=added_po_line_ids,
+            extra_po_lines=extra_po_lines,
         )
 
         # Log rollback su DB
@@ -807,6 +904,319 @@ def api_odoo_status(analysis_id):
         return {
             'writes': [dict(r) for r in rows]
         }
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_autostrade/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_autostrade(analysis_id):
+    """
+    Crea bozza dedicata per fattura Autostrade (IT07516911000).
+
+    Pre-richiede:
+    - L'analisi è di un fornitore mappato in MAPPATURA_FORNITORI_FISSI con
+      P.IVA IT07516911000 (Autostrade).
+    - Il codice_cliente nell'XML è uno dei 6 cc Ecotel mappati.
+    - Per cc Ecotel main: opzionalmente PDF già caricato via
+      /api/upload_pdf/<id> (sblocca R4 split automatico). Altrimenti R1
+      con 2 righe a importo 0.
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import (MAPPATURA_FORNITORI_FISSI, ODOO_WRITE_DRY_RUN,
+                                resolve_mapping_entry)
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+
+        # Risolvo mapping_entry da P.IVA + codice_cliente
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip()
+        if cedente_vat not in MAPPATURA_FORNITORI_FISSI:
+            return jsonify({'success': False,
+                            'error': f"Fornitore {cedente_vat} non in MAPPATURA"}), 400
+        parent = MAPPATURA_FORNITORI_FISSI[cedente_vat]
+        if not parent.get('multi_contratto'):
+            return jsonify({'success': False,
+                            'error': "Fornitore non multi_contratto"}), 400
+        resolved = resolve_mapping_entry(parent, analysis.xml_data)
+        if not resolved:
+            return jsonify({
+                'success': False,
+                'error': f"Codice cliente {analysis.xml_data.codice_cliente} "
+                         f"non mappato per Autostrade",
+            }), 400
+
+        # Recupero pdf_split se l'utente ha caricato il PDF
+        a_row = conn.execute("SELECT pdf_split_furgoni, pdf_split_promiscuo "
+                              "FROM analyses WHERE id=?",
+                              (analysis_id,)).fetchone()
+        pdf_split = None
+        if a_row and a_row['pdf_split_furgoni'] is not None:
+            pdf_split = {
+                'imponibile_furgoni': a_row['pdf_split_furgoni'],
+                'imponibile_promiscuo': a_row['pdf_split_promiscuo'],
+            }
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_autostrade(analysis, resolved, pdf_split)
+
+        # Log su odoo_writes (consume-POL: salvo old_* della 1ª POL +
+        # extra_po_lines come JSON per la 2ª POL Autostrade)
+        added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                         if result.added_po_line_ids else None)
+        extra_pol_json = (json.dumps(result.extra_po_lines)
+                            if result.extra_po_lines else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, added_po_line_ids, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            added_pol_csv, extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_automezzi/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_automezzi(analysis_id):
+    """Crea bozza per fattura Automezzi (7 fornitori noleggio).
+
+    Pattern consume-POL multi-line: ogni riga XML consuma 1 POL libera
+    sull'OdA target (può essere multi-OdA per fatture UnipolRental/Tecnoalt).
+    Conto contabile dedotto da (voce, classificazione veicolo dal Parco Auto).
+    Tax_id da TAX_AUTOMEZZI[vat].
+
+    Salva audit con extra_po_lines_json (schema esistente).
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import (MAPPATURA_AUTOMEZZI, AUTOMEZZI_VATS,
+                                ODOO_WRITE_DRY_RUN)
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip().upper()
+        if cedente_vat not in AUTOMEZZI_VATS:
+            return jsonify({'success': False,
+                            'error': f"P.IVA {cedente_vat} non in MAPPATURA_AUTOMEZZI"}), 400
+        mapping = MAPPATURA_AUTOMEZZI[cedente_vat]
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_automezzi(analysis, mapping)
+
+        # Salva audit
+        extra_pol_json = (json.dumps(result.extra_po_lines)
+                            if result.extra_po_lines else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_telepass_canoni/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_telepass_canoni(analysis_id):
+    """Crea bozza per fattura canoni Telepass (IT09771701001).
+
+    Pattern consume-POL multi-line con riscrittura totale POL "TEST €1
+    generic" su P03722. Ogni riga XML consuma 1 POL libera. Conto
+    contabile dedotto dalla voce identificata nella descrizione XML
+    (canone/parcheggio/bollo/quota_associativa).
+
+    Salva audit con extra_po_lines_json (schema esistente da Autostrade).
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import (MAPPATURA_FORNITORI_FISSI, ODOO_WRITE_DRY_RUN,
+                                resolve_mapping_entry)
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip()
+        if cedente_vat != 'IT09771701001':
+            return jsonify({'success': False,
+                            'error': f"P.IVA {cedente_vat} non è Telepass"}), 400
+        parent = MAPPATURA_FORNITORI_FISSI.get(cedente_vat)
+        if not parent:
+            return jsonify({'success': False,
+                            'error': "Telepass non in MAPPATURA_FORNITORI_FISSI"}), 400
+        resolved = resolve_mapping_entry(parent, analysis.xml_data)
+        if not resolved:
+            return jsonify({
+                'success': False,
+                'error': (f"Codice cliente {analysis.xml_data.codice_cliente} "
+                          f"non mappato per Telepass"),
+            }), 400
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_telepass_canoni(analysis, resolved)
+
+        # Log su odoo_writes (consume-POL multi-line: salvo old_* della 1ª POL
+        # + extra_po_lines_json per le altre)
+        extra_pol_json = (json.dumps(result.extra_po_lines)
+                            if result.extra_po_lines else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/upload_pdf/<int:analysis_id>', methods=['POST'])
+def api_upload_pdf(analysis_id):
+    """
+    Riceve un PDF caricato dall'utente per una fattura specifica (tipicamente
+    Autostrade) e calcola lo split Furgoni/Uso Promiscuo basato sulla mappa
+    apparati. Salva il PDF in pdf_inbox/ e i dati split nel record analyses.
+
+    Pre-condizione: l'utente entra in /invoice/<analysis_id>, vede una sezione
+    "Carica PDF Autostrade per split automatico", upload il file dal portale
+    Telepass.
+    """
+    from core.pdf_parser import parse_pdf_autostrade, calcola_split_furgoni_promiscuo
+    from config.apparati_mapping import get_classificazione
+
+    if 'pdf' not in request.files:
+        return jsonify({'success': False, 'error': 'File pdf mancante'}), 400
+    pdf_file = request.files['pdf']
+    if not pdf_file.filename:
+        return jsonify({'success': False, 'error': 'Filename vuoto'}), 400
+    if not pdf_file.filename.lower().endswith('.pdf'):
+        return jsonify({'success': False, 'error': 'Il file deve essere un PDF'}), 400
+
+    conn = get_db()
+    try:
+        a = conn.execute("SELECT * FROM analyses WHERE id=?",
+                         (analysis_id,)).fetchone()
+        if not a:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+
+        # Salvo PDF in pdf_inbox/<analysis_id>_<numero_fattura>.pdf
+        # (uso analysis_id come prefisso per univocità anche se cambia il numero fattura)
+        inbox_dir = ROOT / 'pdf_inbox'
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        # Sanitize numero fattura per filesystem
+        safe_num = re.sub(r'[^A-Za-z0-9._-]', '_',
+                          (a['invoice_number'] or 'unknown'))[:80]
+        pdf_path = inbox_dir / f"{analysis_id}_{safe_num}.pdf"
+        pdf_file.save(str(pdf_path))
+
+        # Parsing
+        try:
+            pdf_data = parse_pdf_autostrade(str(pdf_path))
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Parsing PDF fallito: {e}',
+                'pdf_path': str(pdf_path),
+            }), 500
+
+        if not pdf_data.apparati:
+            return jsonify({
+                'success': False,
+                'error': 'Nessun apparato estratto dal PDF (layout non riconosciuto?)',
+                'pdf_path': str(pdf_path),
+                'parsing_errors': pdf_data.parsing_errors,
+            }), 422
+
+        # Imponibile fattura: lo prendiamo dal record analyses (campo invoice_total
+        # è IVA inclusa; serve invece l'imponibile XML).
+        # Per Autostrade IVA 22% uniforme: imponibile = total / 1.22
+        invoice_total = float(a['invoice_total'] or 0)
+        imponibile_xml = round(invoice_total / 1.22, 2)
+
+        split = calcola_split_furgoni_promiscuo(
+            pdf_data, imponibile_xml, get_classificazione)
+
+        # Salvo dati split sull'analisi
+        warnings_json = json.dumps(split.get('warnings', []), ensure_ascii=False)
+        conn.execute("""
+            UPDATE analyses
+            SET pdf_path=?, pdf_split_furgoni=?, pdf_split_promiscuo=?,
+                pdf_split_warnings=?
+            WHERE id=?
+        """, (
+            str(pdf_path),
+            split['imponibile_furgoni'],
+            split['imponibile_promiscuo'],
+            warnings_json,
+            analysis_id,
+        ))
+        conn.commit()
+
+        return jsonify({
+            'success': True,
+            'pdf_path': str(pdf_path),
+            'imponibile_xml_stimato': imponibile_xml,
+            'imponibile_furgoni': split['imponibile_furgoni'],
+            'imponibile_promiscuo': split['imponibile_promiscuo'],
+            'apparati_estratti': len(pdf_data.apparati),
+            'apparati_furgoni': len(split['apparati_furgoni']),
+            'apparati_promiscuo': len(split['apparati_promiscuo']),
+            'apparati_non_mappati': len(split['apparati_non_mappati']),
+            'totale_iva_inclusa_pdf': split['totale_iva_inclusa_pdf'],
+            'warnings': split['warnings'],
+        })
     finally:
         conn.close()
 
@@ -1077,7 +1487,7 @@ def _load_analysis_with_match(conn, analysis_id):
         [('id', '=', row['attachment_id'])],
         fields=['id', 'name', 'datas', 'xml_supplier_id',
                 'invoices_total', 'invoices_date', 'inconsistencies',
-                'e_invoice_parsing_error'])
+                'e_invoice_parsing_error', 'create_date'])
     if not atts:
         return None, client
 
@@ -1110,7 +1520,10 @@ def api_odoo_draft_from_oda(analysis_id):
     Replica il flusso "Crea fattura fornitore da OdA": le move line vengono
     ricostruite dalle PO line, NON dalle righe XML. Conto/IVA dedotti da prodotto.
     """
-    AMMESSE = ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+    AMMESSE = ('AUTO_VALIDABILE', 'MATCH_IMPLICITO',
+               'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA',
+               'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
+               'DA_VERIFICARE', 'CUMULATIVO_ECCEDE')
     from core.odoo_writer import OdooWriter
     from config.rules import ODOO_WRITE_DRY_RUN
 
@@ -1148,16 +1561,19 @@ def api_odoo_draft_from_oda(analysis_id):
         result = writer.create_bozza_da_oda_matched(analysis)
 
         from datetime import datetime
+        added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                         if result.added_po_line_ids else None)
         conn.execute("""
             INSERT INTO odoo_writes
             (analysis_id, timestamp, action, success, move_id, po_line_id,
-             error_message, dry_run)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             error_message, dry_run, added_po_line_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             analysis_id, datetime.now().isoformat(),
             result.action, 1 if result.success else 0,
             result.move_id, result.po_line_id,
             result.error_message, 1 if result.dry_run else 0,
+            added_pol_csv,
         ))
         conn.commit()
         return result.to_dict(), (200 if result.success else 500)
@@ -1247,7 +1663,10 @@ def api_odoo_bulk_drafts_from_oda(run_id):
     from core.odoo_writer import OdooWriter
     from config.rules import ODOO_WRITE_DRY_RUN
 
-    AMMESSE = ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+    AMMESSE = ('AUTO_VALIDABILE', 'MATCH_IMPLICITO',
+               'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA',
+               'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
+               'DA_VERIFICARE', 'CUMULATIVO_ECCEDE')
 
     body = request.json if request.is_json else {}
     tipo_doc = body.get('tipo_documento', 'TD01')
@@ -1312,16 +1731,19 @@ def api_odoo_bulk_drafts_from_oda(run_id):
                 writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
                 result = writer.create_bozza_da_oda_matched(analysis)
                 from datetime import datetime
+                added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                                 if result.added_po_line_ids else None)
                 conn.execute("""
                     INSERT INTO odoo_writes
                     (analysis_id, timestamp, action, success, move_id, po_line_id,
-                     error_message, dry_run)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     error_message, dry_run, added_po_line_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     analysis_id, datetime.now().isoformat(),
                     result.action, 1 if result.success else 0,
                     result.move_id, result.po_line_id,
                     result.error_message, 1 if result.dry_run else 0,
+                    added_pol_csv,
                 ))
                 conn.commit()
                 if result.success:
@@ -1368,6 +1790,7 @@ def api_odoo_bulk_rollback(run_id):
         sql = """
             SELECT ow.id as write_id, ow.analysis_id, ow.move_id, ow.po_line_id,
                    ow.old_price_unit, ow.old_name, ow.old_date_planned,
+                   ow.added_po_line_ids,
                    a.classification, a.attachment_id
             FROM odoo_writes ow
             JOIN analyses a ON a.id = ow.analysis_id
@@ -1411,6 +1834,13 @@ def api_odoo_bulk_rollback(run_id):
                     old_dp = r['old_date_planned']
                 except (IndexError, KeyError):
                     pass
+                added_pol_ids = None
+                try:
+                    csv = r['added_po_line_ids']
+                    if csv:
+                        added_pol_ids = [int(x) for x in csv.split(',') if x.strip()]
+                except (IndexError, KeyError, TypeError, ValueError):
+                    added_pol_ids = None
                 result = writer.rollback_bozza(
                     move_id=r['move_id'],
                     po_line_id=r['po_line_id'],
@@ -1418,6 +1848,7 @@ def api_odoo_bulk_rollback(run_id):
                     old_name=r['old_name'],
                     old_date_planned=old_dp,
                     attachment_id=r['attachment_id'],
+                    added_po_line_ids=added_pol_ids,
                 )
                 from datetime import datetime
                 conn.execute("""

@@ -1,0 +1,146 @@
+================================================================================
+RELEASE NOTES — Aggiornamento Telepass Canoni
+Deploy 08/05/2026 (sera) — post deploy Autostrade del mattino
+Odoo Invoice Agent — Ecotel Italia
+================================================================================
+
+PRE-CONDIZIONE
+--------------
+Questo deploy assume che il deploy Autostrade del mattino 08/05/2026 sia
+GIÀ stato applicato sul server (auto_write=True, schema DB con
+extra_po_lines_json, mappa apparati 75 entries). Se non è stato fatto,
+applicare prima quello.
+
+
+COSA AGGIUNGE QUESTO DEPLOY
+================================================================================
+
+Nuova mappatura per le fatture canoni Telepass S.p.A. (IT09771701001):
+- Categorizzate automaticamente come MAPPATURA_FORNITORE_FISSO
+- Box dedicato azzurro sulla pagina dettaglio fattura
+- Pulsante "📡 Crea bozza Telepass canoni"
+- Pattern consume-POL multi-line su P03722 (1 POL libera per riga XML)
+- Routing conto contabile per voce:
+    Canone Telepass     → 420840 (70% deducibile)
+    Parcheggi reselling → 420160 (100% deducibile)
+    Bollo €2            → 490100 (valori bollati)
+    Quota associativa   → 420840
+- Routing tax_id automatico:
+    Aliquota 22% → tax_id 11
+    Bollo (esente) → tax_id 47 (N1 escluse art.15)
+    Quota associativa (esente) → tax_id 54 (N4 esenti)
+- Routing per cc cliente XML: 4 cc Ecotel main mappati su P03722
+    (311531633, 216875601, 261713569, 217718183)
+
+
+PRE-REQUISITO ACQUISTI
+================================================================================
+
+✅ Acquisti ha già esteso P03722 con 20 POL libere generiche
+   (verificato 08/05/2026 sera):
+   - Pattern: name="TEST", price_unit=€1, tax_id=11, qty=1
+   - 1 POL/mese da 04/2026 a 11/2027 (id 73368-73387)
+
+⚠ Volume insufficiente: Telepass emette ~6-8 fatture/mese, le 20 POL
+  coprono ~2-3 mesi a regime. RICARICA on-demand quando l'agent
+  segnala "POL libere insufficienti su P03722".
+
+
+FILE INCLUSI NELLO ZIP
+================================================================================
+
+Modificati (sovrascrivono il deploy Autostrade del mattino):
+  - config/rules.py                     (+ entry IT09771701001)
+  - core/odoo_writer.py                 (+ create_bozza_telepass_canoni)
+  - Agent Invoices/app.py               (+ endpoint /draft_telepass_canoni)
+  - Agent Invoices/templates/invoice_detail.html  (+ box azzurro Telepass)
+
+Invariati (già nel deploy del mattino):
+  - config/apparati_mapping.py          (75 entries Autostrade)
+  - scripts/generate_apparati_mapping.py
+  - scripts/genera_guida_apparati_pdf.py
+  - scripts/preview_bozze_autostrade.py
+  - requirements.txt
+
+
+PROCEDURA DEPLOY (passo per passo)
+================================================================================
+
+1. Backup precauzionale del deploy del mattino:
+     Copy-Item -Path "C:\odoo_apps\invoice_agent" `
+               -Destination "C:\odoo_apps\invoice_agent_backup_20260508_pretelepass" `
+               -Recurse
+
+2. Fermare il webapp.
+
+3. Estrarre il nuovo zip in C:\odoo_apps\invoice_agent\ sovrascrivendo:
+     $ProgressPreference = 'SilentlyContinue'
+     Expand-Archive -Path "$env:USERPROFILE\Desktop\deploy_server.zip" `
+                    -DestinationPath "C:\odoo_apps\invoice_agent\" -Force
+
+4. NESSUNA nuova dipendenza pip da installare (reportlab già presente).
+
+5. NESSUNA migration DB (extra_po_lines_json già esistente dal deploy
+   del mattino).
+
+6. Avviare il webapp:
+     python "Agent Invoices/app.py"
+
+7. Test reale sulla fattura non-registered del 23/04/2026 €239,12
+   (cc 311531633, attachment id 5351754):
+   - Aprire la pagina dettaglio fattura nella webapp
+   - Comparirà box AZZURRO "📡 Telepass S.p.A. — canoni"
+   - Click "📡 Crea bozza Telepass canoni"
+   - Verifica su Odoo:
+       a) Bozza account.move creata in 'draft' con totale €239,12
+       b) POL 73368 su P03722 aggiornata: name=multi-line con
+          "Canone T Business FAS S - Servizi Telepass\nCodice cliente: 311531633",
+          price_unit=196.00, tax=11, qty_invoiced=1, qty_received=1
+       c) move_line con purchase_line_id=73368 collegato
+       d) attachment 5351754 marcato registered=True
+
+
+NOTA AUTO-WRITE
+================================================================================
+
+Telepass nasce con auto_write_enabled=False (analogo Autostrade prima
+del go-live). Per attivare il flusso bulk:
+  1. Aprire config/rules.py
+  2. Cercare la sezione 'IT09771701001'
+  3. Cambiare 'auto_write_enabled': False -> True
+  4. Riavviare webapp
+
+
+ROLLBACK
+================================================================================
+
+Se qualcosa va storto su una bozza Telepass:
+- Dalla dashboard, "Rollback bozza" sulla fattura specifica
+- Ripristina account.move + POL P03722 ai valori originali
+  (name="TEST", price=€1, tax=[11], qty_received=0)
+- Schema audit: extra_po_lines_json già esistente (deploy del mattino)
+
+
+CASI EDGE NOTI
+================================================================================
+
+1. Fattura con N>1 righe XML: l'agent prende N POL libere consecutive
+   (FIFO id ascending) e le riscrive ognuna. Se le POL libere su P03722
+   sono <N, errore esplicito "POL libere insufficienti".
+
+2. Voce non riconosciuta dalla descrizione XML: di default cade in
+   'canone' (conto 420840 70%). Casi noti: tutte le voci principali
+   sono coperte (Canone, Parcheggi, Bollo, Quota associativa).
+
+3. Aliquota XML diversa da 22/0: di default usa tax_id 11 (22%).
+   Edge case raro.
+
+4. cc cliente non in mappa (es. cc Utterson 184015247 storico): il
+   resolve_mapping_entry torna None, l'endpoint risponde 400 con
+   "Codice cliente NNN non mappato per Telepass". Aggiungere il cc
+   in config/rules.py se serve.
+
+
+CONTATTI
+================================================================================
+Per chiarimenti: Luca Ranalletta (lranalletta@ecotelitalia.it)

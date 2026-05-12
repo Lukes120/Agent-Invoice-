@@ -156,6 +156,16 @@ Quando la fattura non cita un OdA esplicito in XML, l'agent prova un match impli
 
 Il post-filtro commessa **non blocca** il flow: se la commessa è presente ma nessun candidato ha origin compatibile, prosegue con i candidati originali. Pattern "ritiro al banco" (Wuerth NC0YN/NBNUX): commessa S03146 nell'XML → candidate pool ristretto agli OdA con origin "S03146 ..." → match univoco su importo + codArt + desc.
 
+### Spese accessorie con OdA esplicito → MATCH_PARZIALE_OK (fix 05-05-2026)
+
+Se nel CASO 3 di `_classify` (OdA esplicito) la fattura ha `keyword_count > 0` (righe spese accessorie tipo "Spese di Trasporto" / "Bolli" / "Oneri bancari" riconosciute dal matcher) **E** l'imponibile-keyword quadra col totale OdA, l'agent classifica come `MATCH_PARZIALE_OK` (NON `AUTO_VALIDABILE`) e popola `analysis.partial_extra_lines` con le righe keyword.
+
+Senza questo passaggio il writer `create_bozza_da_oda_matched` rifiutava col banner "Discrepanza tra imponibile fattura €X e somma righe da fatturare nell'OdA €Y" perché lui confronta col residuo OdA reale, mentre il classifier sottraeva le keyword. Con `MATCH_PARZIALE_OK` invece si attiva `_add_extra_pol_to_oda` (toggle `ADD_EXTRA_POL_TO_ODA_ENABLED`, soglia `ADD_EXTRA_POL_MAX_AMOUNT=200€`) che crea automaticamente la POL accessoria sull'OdA con conto da `EXTRA_POL_MAPPING_ECOTEL` (TRASPORTO 420110, BOLLO 490100, ONERI_BANCARI 420410).
+
+Helper: `_build_extra_lines_from_keyword_matches` (in `core/fatturapa_analyzer.py`) risale dalle `LineMatch.invoice_line` alle `FatturaPALine` originali per costruire il dict che `_add_extra_pol_to_oda` consuma.
+
+Effetto deploy 05-05: 30/57 fatture Rema Tarlazzi non-registered passate da AUTO_VALIDABILE (write bloccato) a MATCH_PARZIALE_OK (write OK con POL accessoria automatica). Pattern generale: si applica a qualunque fornitore con stesso schema.
+
 ### Note di credito (TD04)
 
 Gestione particolare:
@@ -165,9 +175,15 @@ Gestione particolare:
 
 **Convenzione Ecotel (confermata con contabilità 2026-04-27)**: per le NC il move_line deve avere `quantity=-1` e `price_unit=-X` (entrambi negativi). Subtotale = (-1)*(-X) = +X (positivo). Odoo con `move_type=in_refund` calcola `PO.qty_invoiced = +1` (positivo, mostrato come "Quantità Fatturata" sulla PO line). Tutti e 3 i writer (`create_bozza_fornitore_fisso`, `create_bozza_multilinea`, `create_bozza_da_oda_matched`) seguono questa convenzione. Verifica empirica: 18 NC Trenitalia posted manualmente avevano già questo pattern.
 
-### Data competenza IVA
+### Data contabile e competenza IVA
 
-Convenzione italiana: `date` e `l10n_it_vat_settlement_date` del move = **fine mese** della data fattura. Helper `_end_of_month()` in `odoo_writer.py`. Vale anche per le NC.
+Convenzione Ecotel (decisa con contabilità il 2026-05-04): le due date sono **disaccoppiate**.
+
+- **`date` (Data contabile)** = data di ricezione SdI dell'allegato, cioè il `create_date` del record `fatturapa.attachment.in` su Odoo, troncato a `YYYY-MM-DD`. Helper `_data_contabile(analysis, invoice_date)` in `odoo_writer.py`. Fallback su `_end_of_month(invoice_date)` se manca `create_date`.
+
+- **`l10n_it_vat_settlement_date` (Data competenza IVA)** = fine mese della data fattura (`invoice_date`). Helper `_end_of_month(invoice_date)`.
+
+Vale per tutti i tipi documento (TD01, TD04, TD24, TD25) e tutti e 4 i writer.
 
 ### Campi obbligatori nel move_line
 

@@ -65,7 +65,10 @@ MATCH_PARZIALE_ATTIVO = True
 
 # Numero massimo di righe fattura per applicare il match parziale.
 # Oltre, i sottoinsiemi esplodono (2^N) e la performance ne risente.
-MATCH_PARZIALE_MAX_RIGHE = 12
+# 2^20 ≈ 1M sottoinsiemi → ~0.5s per fattura, ancora gestibile.
+# Alzato da 12 a 20 il 2026-05-03 dopo audit: sblocca ~7 fatture/run
+# senza rischiare timeout (es. Edilnovelli 17 righe, Wuerth 23 → 23 fuori).
+MATCH_PARZIALE_MAX_RIGHE = 20
 
 # Soglia massima: una singola riga "extra" non può essere > X% dell'imponibile.
 # Sopra questa soglia, match scartato per prudenza (una riga grossa tolta
@@ -121,6 +124,8 @@ KEYWORD_RULES = [
     ("bollo",      "CONTO_BOLLI",     "BOLLO"),
     ("imball",     "CONTO_IMBALLAGGI","IMBALLAGGIO"),
     ("conai",      "CONTO_CONAI",     "CONTRIBUTO"),
+    ("incasso",    "CONTO_ONERI_BANCARI", "ONERI_BANCARI"),
+    ("bonifico",   "CONTO_ONERI_BANCARI", "ONERI_BANCARI"),
 ]
 
 # ============================================================
@@ -135,6 +140,78 @@ CONTI_CONTABILI = {
     "CONTO_CONAI":        "DA_COMPILARE",
     "CONTO_DIFFERENZE":   "DA_COMPILARE",  # differenze di acquisto entro tolleranza
 }
+
+
+# ============================================================
+# MAPPING ID ODOO PER RIGHE ACCESSORIE (POL extra su OdA)
+# ============================================================
+# Quando il classifier rileva MATCH_PARZIALE_OK con righe extra (spese
+# trasporto, bolli, oneri bancari) il writer aggiunge una purchase.order.line
+# dedicata sull'OdA per ogni riga extra (pattern operatore: 100% delle
+# fatture posted ha le accessorie collegate a una POL, mai righe libere
+# nel move). Per Ecotel (company_id=1).
+#
+# Categoria → dict con:
+#   account_id: id account.account contabile (override su move_line)
+#   product_id: id product.product (service generico)
+#   description_prefix: prefisso opzionale per la descrizione POL
+EXTRA_POL_MAPPING_ECOTEL = {
+    "TRASPORTO": {
+        "account_id": 125,    # 420110 costi di trasporto e spedizione
+        "product_id": 12285,  # service "spese di trasporto"
+    },
+    "BOLLO": {
+        "account_id": 160,    # 490100 valori bollati e imposte diverse
+        "product_id": 12302,  # service "BOLLO"
+    },
+    "ONERI_BANCARI": {
+        "account_id": 134,    # 420410 oneri bancari
+        "product_id": 22859,  # service "Spese Incasso"
+    },
+    "IMBALLAGGIO": {
+        "account_id": 125,    # fallback su trasporto/spedizione (no conto dedicato)
+        "product_id": 12285,
+    },
+    "CONTRIBUTO": {
+        "account_id": 125,    # fallback (no conto dedicato CONAI in Ecotel)
+        "product_id": 12285,
+    },
+    # Default quando la keyword non è riconosciuta: trattata come trasporto
+    # (categoria di gran lunga più frequente, vedi audit storico).
+    "_DEFAULT": {
+        "account_id": 125,
+        "product_id": 12285,
+    },
+}
+
+# Mapping IVA → tax_id per le righe extra (acquisti, Ecotel).
+# Il classifier prende l'aliquota dalla riga XML <AliquotaIVA>.
+EXTRA_POL_TAX_BY_IVA_ECOTEL = {
+    22.0: 6,   # 22% G
+    10.0: 7,   # 10% G
+    4.0:  58,  # 4%
+    0.0:  None,  # esente: gestire caso per caso (richiede tax esente specifica)
+}
+
+# Toggle globale per attivare/disattivare l'aggiunta automatica POL extra.
+# Quando False, MATCH_PARZIALE_OK con extra resta bloccato (comportamento legacy).
+ADD_EXTRA_POL_TO_ODA_ENABLED = True
+
+# Soglia massima per importo singola riga extra (sicurezza).
+# Sopra questo importo, il writer rifiuta di aggiungere la POL automaticamente
+# (probabile errore di classificazione o falso positivo).
+ADD_EXTRA_POL_MAX_AMOUNT = 200.0
+
+# Soglia (EUR) sotto la quale il delta di MATCH_DA_SUGGERIMENTO_PIU_EXTRA è
+# trattato come ARROTONDAMENTO: la riga viene agganciata all'OdA ereditando
+# product/UoM/commessa/IVA dalla prima POL matchata e usa il conto merci
+# c/acquisti (ROUNDING_ACCOUNT_ID_ECOTEL). Sopra la soglia il comportamento
+# resta quello legacy (riga "Spese accessorie" su 420110, no aggancio OdA).
+ROUNDING_THRESHOLD_AMOUNT = 1.0
+
+# Conto contabile per arrotondamenti (Ecotel). 410100 = merci c/acquisti.
+# Verificato 2026-05-04 via XML-RPC su prod.
+ROUNDING_ACCOUNT_ID_ECOTEL = 115
 
 
 # ============================================================
@@ -414,6 +491,76 @@ MAPPATURA_FORNITORI_FISSI = {
             },
         },
     },
+    # AUTOSTRADE PER L'ITALIA S.P.A. — multi-contratto routing per codice cliente
+    # (estratto dalla <Causale> XML "Codice cliente: NNN").
+    # Pattern decifrato in plans/crispy-napping-tower.md sez. 3.2 (analisi v3).
+    # Per i 4 cc main Ecotel: split A/B Furgoni (420160 100%) / Uso Promiscuo
+    # (420840 70%) — il writer dedicato create_bozza_autostrade gestisce la
+    # logica R4 (split automatico via PDF + APPARATI_MAP) o fallback R1
+    # (2 righe vuote a importo 0, contabile inserisce manualmente).
+    # I cc ex-Utterson e residuo sono stati chiusi (07/05/2026) — eventuali
+    # fatture residue cadono in DA_VERIFICARE per gestione manuale.
+    # TELEPASS S.P.A. — canoni Telepass mensili (Telepass-network)
+    # Multi-contratto routing per codice cliente XML (causale "Codice cliente: NNN").
+    # 4 cc Ecotel main → P03722. POL libere generiche "TEST €1 tx=11"
+    # pre-create da Acquisti, riscritte completamente dall'agent al consumo.
+    # Pattern decifrato 08/05/2026 da plans/hashed-marinating-kettle.md.
+    # Voci attese sulle fatture XML: Canone Telepass / Canone T Business FAS S /
+    # Parcheggi reselling / Quota associativa / Bollo. Routing conto contabile
+    # via helper _classify_voce_telepass() nel writer.
+    'IT09771701001': {
+        'nome': 'Telepass S.p.A.',
+        'multi_contratto': True,
+        'partner_id': 1240,
+        'journal_id': 2,
+        'company_id': 1,
+        'taxes_id': [11],                # 22% S default sui canoni
+        'auto_write_enabled': False,     # NON attiva: validazione prima
+        'description_strategy': 'telepass_canoni',
+        # Conti contabili per voce (id Odoo Ecotel verificati prod)
+        'conto_canone_id':     1124,     # 420840 pedaggi 70%
+        'conto_parcheggio_id':  368,     # 420160 pedaggi 100%
+        'conto_bollo_id':       160,     # 490100 valori bollati
+        'contratti': {
+            '311531633': {'oda_fisso': 'P03722', 'cc_type': 'telepass_main'},
+            '216875601': {'oda_fisso': 'P03722', 'cc_type': 'telepass_main'},
+            '261713569': {'oda_fisso': 'P03722', 'cc_type': 'telepass_main'},
+            '217718183': {'oda_fisso': 'P03722', 'cc_type': 'telepass_main'},
+        },
+    },
+    'IT07516911000': {
+        'nome': 'Autostrade per l\'Italia S.p.A.',
+        'multi_contratto': True,
+        'partner_id': None,  # da censire al primo uso (ID Odoo verificato runtime)
+        'journal_id': 2,
+        'company_id': 1,
+        # Conti split (id verificati Ecotel su prod, vedi piano v3 sez. 1.4)
+        'conto_furgoni_id': 368,         # 420160 pedaggi 100%
+        'conto_promiscuo_id': 1124,      # 420840 pedaggi 70%
+        # Default per cc main: split A/B
+        'taxes_id': [11],                # 22% S
+        'auto_write_enabled': True,      # ATTIVA dal 07/05/2026 (consume-POL)
+        'description_strategy': 'autostrade_main',
+        'contratti': {
+            # 4 cc Ecotel main → P03718 (vivo, 35 righe libere al 02/05/2026)
+            '261713569': {
+                'oda_fisso': 'P03718',
+                'cc_type': 'ecotel_main',  # split A/B
+            },
+            '217718183': {
+                'oda_fisso': 'P03718',
+                'cc_type': 'ecotel_main',
+            },
+            '216875601': {
+                'oda_fisso': 'P03718',
+                'cc_type': 'ecotel_main',
+            },
+            '311531633': {
+                'oda_fisso': 'P03718',
+                'cc_type': 'ecotel_main',
+            },
+        },
+    },
 }
 
 # Abilita/disabilita mappatura fornitori fissi
@@ -422,6 +569,209 @@ MAPPATURA_FORNITORI_FISSI_ATTIVA = True
 # Abilita/disabilita scrittura reale su Odoo (dry-run se False)
 # IMPORTANTE: tenere False fino a quando non si è sicuri della logica
 ODOO_WRITE_DRY_RUN = False
+
+
+# ============================================================
+# MAPPATURA_AUTOMEZZI — categoria dashboard "Automezzi"
+# 7 fornitori noleggio veicoli (Leasys/Tecnoalt/UnipolRental/Athlon/
+# Arval/ALD/LeasePlan). Pattern consume-POL multi-line con riscrittura
+# completa POL libere su OdA-ledger annuali (Pattern A) o multi-OdA per
+# veicolo (Tecnoalt 2026, Pattern B).
+# Implementato 08/05/2026 in unico rilascio.
+# ============================================================
+
+# Conti contabili (id Odoo Ecotel verificati prod)
+# Logica: <voce> x <classificazione> -> conto
+CONTO_AUTOMEZZI = {
+    ('locazione', 'POOL'):           398,    # 430210 — 100% deduc
+    ('locazione', 'uso_promiscuo'):  399,    # 430220 — 70% deduc
+    ('locazione', 'super_lusso'):   1119,    # 430225 — 20% deduc
+    ('servizi',   'POOL'):           400,    # 430230 — 100% deduc
+    ('servizi',   'uso_promiscuo'):  401,    # 430240 — 70% deduc
+    ('servizi',   'super_lusso'):   1119,    # fallback su 430225
+    ('tassa',     'POOL'):           161,    # 490300 — bollo 100%
+    ('tassa',     'uso_promiscuo'): 1129,    # 490410 — bollo 70%
+    ('tassa',     'super_lusso'):   1129,    # fallback
+    # Spese di incasso bancario (Tecnoalt riga "SPESE DI INCASSO" 3.50€):
+    # tutte vanno su conto oneri bancari indipendentemente da classificazione
+    ('spese_incasso', 'POOL'):           134,    # 420410 — oneri bancari
+    ('spese_incasso', 'uso_promiscuo'):  134,
+    ('spese_incasso', 'super_lusso'):    134,
+}
+
+# Tax_id per fornitore + (voce, classificazione)
+# Pattern dedotto da analisi cross-tab Q1 2026:
+#   Leasys/ALD/Arval/UnipolRental: tax 6 (22% G — locazione operativa NLT)
+#   Tecnoalt: tax 11 (22% S — noleggio attrezzature speciali)
+#   Athlon: tax 11 standard, tax 73 (IVA indetraibile 60%) per super_lusso
+#   Bollo/tasse: tax 47 (N1 escluse) per tutti
+TAX_AUTOMEZZI = {
+    'IT06714021000': {  # Leasys
+        ('locazione',     '*'): 6,
+        ('servizi',       '*'): 6,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 6,
+    },
+    'IT01924961004': {  # ALD Automotive
+        ('locazione',     '*'): 6,
+        ('servizi',       '*'): 6,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 6,
+    },
+    'IT04911190488': {  # Arval
+        ('locazione',     '*'): 6,
+        ('servizi',       '*'): 6,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 6,
+    },
+    'IT03740811207': {  # UnipolRental
+        ('locazione',     '*'): 6,
+        ('servizi',       '*'): 6,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 6,
+    },
+    'IT05580391000': {  # Tecnoalt — noleggio attrezzature
+        ('locazione',     '*'): 11,
+        ('servizi',       '*'): 11,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 11,    # tax 22% S anche su spese
+    },
+    'IT10641441000': {  # Athlon — leasing
+        ('locazione', 'POOL'):          11,
+        ('locazione', 'uso_promiscuo'): 11,
+        ('locazione', 'super_lusso'):   73,    # IVA indetraibile 60%
+        ('servizi',   'POOL'):          11,
+        ('servizi',   'uso_promiscuo'): 11,
+        ('servizi',   'super_lusso'):   73,
+        ('tassa',     '*'):             47,
+        ('spese_incasso', '*'):         11,
+    },
+    'IT02615080963': {  # LeasePlan — assumiamo come Leasys (NLT)
+        ('locazione',     '*'): 6,
+        ('servizi',       '*'): 6,
+        ('tassa',         '*'): 47,
+        ('spese_incasso', '*'): 6,
+    },
+}
+
+# Mappatura principale per i 7 fornitori automezzi.
+# Stato OdA verificato 08/05/2026 (vedi output/report_oda_automezzi_*.xlsx)
+MAPPATURA_AUTOMEZZI = {
+    'IT06714021000': {  # Leasys Italia S.p.A.
+        'nome': 'Leasys Italia S.p.A.',
+        'partner_id': 1638,
+        'oda_fisso': 'P03021',     # 31 POL libere (~1 mese di copertura)
+        'oda_oneri': 'P03555',     # SATURO, solo storico
+        'multi_contratto': False,
+        'description_strategy': 'leasys',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT05580391000': {  # Tecnoalt S.r.l. — multi-OdA per veicolo
+        'nome': 'Tecnoalt S.r.l.',
+        'partner_id': 1305,
+        'multi_contratto': True,
+        # Override classificazione: tutti i veicoli/attrezzature Tecnoalt
+        # sono POOL aziendale (van/gru/attrezzature lavorative). Se la targa
+        # non è nel Parco Auto (es. GP220XA gru, attrezzature non standard),
+        # usa POOL come default invece del fallback uso_promiscuo generico.
+        'classificazione_default': 'POOL',
+        'contratti': {
+            # numero_contratto -> OdA target (verificati 09/05/2026)
+            '693944':  {'oda_fisso': 'P04652', 'targa': 'GL999BT'},
+            '817236':  {'oda_fisso': 'P04639', 'targa': 'GP642XH'},
+            '839810':  {'oda_fisso': 'P04655', 'targa': 'GT453FN'},
+            '822738':  {'oda_fisso': 'P04617', 'targa': 'GP454SF'},
+            '642645':  {'oda_fisso': 'P04661', 'targa': 'GJ531GR'},
+            '814785':  {'oda_fisso': 'P02976', 'targa': 'GP220XA'},  # GRU RETROCABINA EFFER
+            # GK207XR (no num contratto) -> P04664 default
+        },
+        'oda_default': 'P04664',
+        'description_strategy': 'tecnoalt',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT03740811207': {  # UnipolRental S.p.A.
+        'nome': 'UnipolRental S.p.A.',
+        'partner_id': 1937,
+        'multi_contratto': True,
+        'contratti': {
+            # Numero contratto estratto da regex "Contr. n.NNN" sulla desc XML
+            '522375-3': {'oda_fisso': 'P03363'},
+            '532705':   {'oda_fisso': 'P03365'},
+            '1232866':  {'oda_fisso': 'P03495'},
+            '1315327':  {'oda_fisso': 'P03495'},
+            '1356145':  {'oda_fisso': 'P03495'},
+            '1356154':  {'oda_fisso': 'P03495'},
+            '1314450':  {'oda_fisso': 'P03363'},
+        },
+        'oda_default': 'P03495',     # OdA principale Ecotel multi-veicolo
+        'description_strategy': 'unipol',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT10641441000': {  # Athlon Car Lease Italy S.r.l.
+        'nome': 'Athlon Car Lease Italy S.r.l.',
+        'partner_id': 1984,
+        'oda_fisso': 'P04797',       # nuovo 27/04/2026, POL HD446BE (Mercedes GLE)
+        'oda_storico': 'P03798',     # POL GW950EK (BMW X4 Bruno Agostino)
+        'multi_contratto': False,
+        # Athlon ha 1 OdA per veicolo (P03798=GW950EK, P04797=HD446BE),
+        # quindi fatture multi-veicolo spanano più OdA. Flag attiva l'auto-discovery
+        # per targa cross-OdA anche fuori dal ramo multi_contratto.
+        'multi_oda_per_targa': True,
+        # POL pre-pianificate da Acquisti hanno già name semantico
+        # ("Noleggio Mercedes-Benz GLE Coupé\nTarga: HD446BE\nPeriodo: ...").
+        # Preservare il name evita di sovrascrivere con la desc XML muta
+        # ("Fatturazione contratto").
+        'keep_pol_name': True,
+        # Se per (targa, periodo) non esiste POL libera, creiamo nuove POL
+        # al volo + opzionalmente riempiamo i buchi mancanti fino alla prossima
+        # POL pre-pianificata (es. Maggio + Giugno HD446BE).
+        'auto_create_missing_pol': True,
+        'fill_pol_gap_until_next': True,
+        'description_strategy': 'athlon',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT04911190488': {  # Arval Service Lease Italia
+        'nome': 'Arval Service Lease Italia S.p.A.',
+        'partner_id': 1287,
+        'oda_fisso': 'P03405',
+        'multi_contratto': False,
+        'description_strategy': 'arval',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT01924961004': {  # ALD Automotive Italia S.r.l.
+        'nome': 'ALD Automotive Italia S.r.l.',
+        'partner_id': 1000,
+        'oda_fisso': 'P03053',
+        'multi_contratto': False,
+        'description_strategy': 'ald',
+        'auto_write_enabled': True,
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    'IT02615080963': {  # LeasePlan Italia S.p.A.
+        'nome': 'LeasePlan Italia S.p.A.',
+        'partner_id': 1415,
+        'oda_fisso': None,           # nessun OdA attivo, da censire
+        'multi_contratto': False,
+        'description_strategy': 'leaseplan',
+        'auto_write_enabled': False, # disattivo finché non c'è OdA
+        'journal_id': 2,
+        'company_id': 1,
+    },
+}
+
+AUTOMEZZI_VATS = set(MAPPATURA_AUTOMEZZI.keys())
+MAPPATURA_AUTOMEZZI_ATTIVA = True
 
 
 # ============================================================
@@ -463,6 +813,10 @@ def resolve_mapping_entry(mapping_entry, xml_data):
         xml_refs.add(rif_amm.strip())
     for pod in getattr(xml_data, 'pod_riferimenti', []) or []:
         xml_refs.add(pod.strip())
+    # Codice cliente (Telepass-network: routing via Causale "Codice cliente: NNN")
+    cc = getattr(xml_data, 'codice_cliente', None)
+    if cc:
+        xml_refs.add(cc.strip())
 
     matched_contratto = None
     matched_key = None

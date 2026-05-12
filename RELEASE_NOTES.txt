@@ -1,0 +1,220 @@
+================================================================================
+RELEASE NOTES — Deploy 07/05/2026 (sera)
+Odoo Invoice Agent — Ecotel Italia
+================================================================================
+
+PRIMA DI ESTRARRE LO ZIP
+------------------------
+- Fare backup della cartella `C:\odoo_apps\invoice_agent` (per sicurezza).
+- Fermare il processo del webapp (`python "Agent Invoices/app.py"`).
+
+CONTENUTO ZIP
+-------------
+File modificati:
+  - config/apparati_mapping.py        (rigenerato: 74 entries, 4 cc Ecotel main)
+  - config/rules.py                   (ex-Utterson rimossi dalla mappatura)
+  - core/odoo_writer.py               (writer Autostrade switch a consume-POL)
+  - Agent Invoices/app.py             (schema DB esteso + persistenza extra_po_lines)
+  - scripts/generate_apparati_mapping.py (esteso con stati + diff)
+  - requirements.txt                  (aggiunto reportlab>=4.0.0)
+
+File nuovi:
+  - scripts/genera_guida_apparati_pdf.py
+  - scripts/preview_bozze_autostrade.py
+
+
+COSA CAMBIA
+================================================================================
+
+1. WRITER AUTOSTRADE: switch a CONSUME-POL
+------------------------------------------
+Il writer create_bozza_autostrade per i 4 cc Ecotel main (216875601, 261713569,
+217718183, 311531633) NON crea più move_line freeform sull'OdA P03718.
+
+Adesso, per ogni fattura aprile/maggio/...:
+  - Cerca 2 POL libere su P03718 matchate per cc + classificazione
+    (priorità POL cc-specifica, fallback POL jolly multi-cc).
+  - Aggiorna ogni POL con price_unit reale, name allineato al formato
+    utenti, qty_received=1, qty_received_manual=1, date_planned=data fattura.
+  - Crea le 2 move_line con purchase_line_id collegato (vera linkatura
+    OdA <-> fattura, come per Trenitalia/Italo).
+
+EFFETTO sull'OdA: i contatori qty_invoiced e amount_total ora si muovono in
+modo coerente con il fatturato reale. L'OdA non è più un "libro mastro
+vuoto" come nel modello freeform precedente.
+
+Pattern name POL aggiornata = stesso usato dagli operatori per le 24 POL
+gen-mar 2026:
+    PEDAGGI AUTOSTRADALI
+    Codice cliente: <CC>
+    <furgoni|uso promiscuo>
+
+
+2. EX-UTTERSON CHIUSI
+---------------------
+Rimossi da config/rules.py i 2 sub-entry per i cc:
+  - 184015247 (era P03899 ex-Utterson)
+  - 465988270 (era P03759 residuo)
+
+Eventuali fatture future con uno di quei 2 cc cadono in DA_VERIFICARE per
+gestione manuale (corretto, contratti chiusi).
+
+I 4 OdA storici (P03899, P03900, P03759, P03760) restano su Odoo a
+documentare le fatture pregresse: l'agent non li tocca più.
+
+
+3. MAPPA APPARATI RIGENERATA
+----------------------------
+config/apparati_mapping.py adesso ha 74 entries (55 MAPPATO + 19 CENSITO),
+generata da input/Apparati completo TOT.xlsx (foglio "Totale").
+
+Distribuzione classificazione: 28 uso_promiscuo + 46 furgoni.
+
+NB: la cartella `input/` sul server NON viene aggiornata da questo zip. Se
+si vuole rigenerare la mappa sul server lanciando lo script, va prima
+copiato il file Excel sorgente nella cartella `input/`.
+
+
+4. GENERATOR ESTESO
+-------------------
+scripts/generate_apparati_mapping.py supporta ora 4 stati:
+  - MAPPATO   = apparato attivo, info complete
+  - CENSITO   = apparato attivo, pool/info parziali
+  - DISMESSO  = restituito (storico — resta in mappa per fatture pregresse)
+  - GUASTA    = guasto (storico — idem)
+
+Output console include:
+  - Diff vs versione precedente: apparati nuovi/rimossi/modificati
+  - Validazione consistenza chiave (codice_apparato, cc_cliente)
+  - Warning su duplicati intra-cc o codici condivisi tra cc multipli
+
+Uso:
+    python scripts/generate_apparati_mapping.py --print-summary
+
+
+5. SCHEMA DB AGGIORNATO
+-----------------------
+Tabella `odoo_writes` (in webapp/dashboard.db) ha una nuova colonna:
+    extra_po_lines_json TEXT NULL
+
+Necessaria per persistere il rollback delle 2 POL consumate da Autostrade
+(consume-POL multi). La migration è AUTOMATICA: avviando il webapp
+(`python "Agent Invoices/app.py"`) la init_db() esegue ALTER TABLE
+idempotente. Niente azioni manuali.
+
+
+6. NUOVI SCRIPT
+---------------
+- scripts/genera_guida_apparati_pdf.py
+    Genera output/Guida_Apparati_Parco.pdf da consegnare all'ufficio
+    parco/contabilità. 7 sezioni: scopo file, struttura colonne, stati
+    ammessi, regole d'oro, workflow operativo, cosa NON fare, FAQ.
+    Uso: python scripts/genera_guida_apparati_pdf.py
+
+- scripts/preview_bozze_autostrade.py
+    Simula le bozze account.move che il writer creerebbe per le fatture
+    Autostrade nei PDF in input/, e mostra anche lo stato dell'OdA P03718
+    prima/dopo. Output Excel multi-foglio in output/. Niente scrittura su
+    Odoo.
+    Uso: python scripts/preview_bozze_autostrade.py
+
+
+7. AUTO-WRITE AUTOSTRADE: ATTIVA (07/05/2026)
+---------------------------------------------
+Da questa release `auto_write_enabled=True` nella mappatura Autostrade. Le
+fatture per i 4 cc Ecotel main (216875601, 261713569, 217718183, 311531633)
+verranno processate automaticamente dal flusso bulk e dal box arancione
+"Crea bozza Autostrade" della webapp.
+
+Effetto pratico:
+  - Quando arriva una fattura Autostrade da SDI, viene classificata come
+    MAPPATURA_FORNITORE_FISSO.
+  - Sulla pagina dettaglio fattura compare il box arancione con i 2 step
+    (upload PDF -> crea bozza con split apparati).
+  - Anche il flusso bulk dalla pagina "/invoices?class=
+    MAPPATURA_FORNITORE_FISSO" può creare bozze Autostrade.
+
+ATTENZIONE alla prima fattura processata:
+  - Verificare che le 2 POL libere su P03718 siano state aggiornate col
+    formato corretto (PEDAGGI AUTOSTRADALI / Codice cliente: <CC> /
+    <furgoni|uso promiscuo>).
+  - Verificare il purchase_line_id collegato alla move_line.
+  - Se qualcosa va male, rollback immediato dal pulsante "Rollback bozza"
+    nella dashboard (ripristina entrambe le POL ai vecchi valori).
+
+In caso di problemi su prod si può RIPORTARE TEMPORANEAMENTE A FALSE
+modificando `config/rules.py:514` e riavviando il webapp.
+
+
+PROCEDURA DEPLOY (passo per passo)
+================================================================================
+
+1. Backup precauzionale (eseguire sul server in PowerShell):
+     Copy-Item -Path "C:\odoo_apps\invoice_agent" `
+               -Destination "C:\odoo_apps\invoice_agent_backup_20260507" `
+               -Recurse
+
+2. Fermare il webapp Python (chiudere la console o Ctrl+C).
+
+3. Estrarre lo zip in `C:\odoo_apps\invoice_agent\` sovrascrivendo i file
+   esistenti.
+
+4. Installare la nuova dipendenza reportlab:
+     cd C:\odoo_apps\invoice_agent
+     pip install -r requirements.txt
+
+5. Avviare il webapp:
+     python "Agent Invoices/app.py"
+
+   La init_db() eseguirà automaticamente l'ALTER TABLE per
+   `extra_po_lines_json`. Verificare che il log non riporti errori.
+
+6. Test rapido:
+   - Aprire la dashboard nel browser
+   - Aprire la pagina di una fattura Autostrade qualsiasi (anche già
+     processata)
+   - Verificare che il box arancione "Step 1 / Step 2 — Autostrade" sia
+     visibile (presenza UI dedicata già deployata 06-05)
+
+7. PRIMO TEST REALE consume-POL (auto-write già attivo):
+     - Caricare il PDF di una fattura Autostrade in ingresso
+     - Cliccare "Crea bozza Autostrade" sul box arancione
+     - Verificare su Odoo:
+         a) la bozza account.move è stata creata in 'draft'
+         b) le 2 POL consumate su P03718 hanno qty_invoiced=1, qty_received=1,
+            price_unit aggiornato, name nel formato 3-righe utenti
+         c) le 2 move_line hanno purchase_line_id valorizzato
+         d) l'attachment fatturapa.attachment.in è registered=True
+     - Se tutto OK, procedere con bulk sulle altre fatture
+     - Se qualcosa non torna, "Rollback bozza" dalla dashboard ripristina
+       sia il move sia entrambe le POL P03718
+
+
+ROLLBACK
+================================================================================
+
+Se qualcosa va storto:
+  1. Fermare il webapp
+  2. Cancellare la cartella `C:\odoo_apps\invoice_agent`
+  3. Rinominare `invoice_agent_backup_20260507` a `invoice_agent`
+  4. (Opzionale) Rollback colonna DB:
+       ALTER TABLE odoo_writes DROP COLUMN extra_po_lines_json
+     -- in realtà non serve: la colonna è nullable e non rompe il codice
+     vecchio se lasciata vuota.
+  5. Riavviare webapp
+
+
+DA CONSEGNARE FUORI DALLO ZIP
+================================================================================
+
+- output/Guida_Apparati_Parco.pdf
+    Da inoltrare via email all'ufficio parco/contabilità.
+
+- output/preview_bozze_autostrade_<TS>.xlsx
+    Solo per validazione interna prima di attivare auto-write su
+    Autostrade.
+
+
+CONTATTI
+================================================================================
+Per chiarimenti tecnici: Luca Ranalletta (lranalletta@ecotelitalia.it)

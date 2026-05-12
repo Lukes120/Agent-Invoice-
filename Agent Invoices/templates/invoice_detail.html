@@ -39,9 +39,20 @@
   </div>
 </div>
 
-{% if a['classification'] in ('MAPPATURA_FORNITORE_FISSO', 'AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA') %}
+{% if a['classification'] in ('MAPPATURA_FORNITORE_FISSO', 'MAPPATURA_AUTOMEZZI', 'AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA', 'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK', 'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
 <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-5 mb-6">
-  {% if a['classification'] == 'MAPPATURA_FORNITORE_FISSO' %}
+  {% if a['classification'] == 'MAPPATURA_AUTOMEZZI' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (Automezzi 🚗)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    Fattura del fornitore noleggio veicoli (Leasys/Tecnoalt/UnipolRental/Athlon/
+    Arval/ALD/LeasePlan). La bozza viene creata col writer dedicato
+    consume-POL multi-line: ogni riga XML consuma 1 POL libera dell'OdA target,
+    riscrivendola completamente (name/price/tax/conto). Il conto è dedotto da
+    voce + classificazione veicolo (POOL/uso_promiscuo/super_lusso) dal Parco
+    Auto. <b>Usa il pulsante verde "🚗 Crea bozza Automezzi" qui sotto</b>;
+    Rollback e stato disponibili come per le altre categorie.
+  </p>
+  {% elif a['classification'] == 'MAPPATURA_FORNITORE_FISSO' %}
   <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (mappatura fornitore fisso)</h2>
   <p class="text-sm text-emerald-700 mb-3">
     Questa fattura può essere registrata automaticamente come bozza in Odoo
@@ -74,7 +85,7 @@
     automaticamente. Verifica MANUALMENTE l'OdA e le righe consumate prima
     del posting in Odoo.
   </div>
-  {% else %}
+  {% elif a['classification'] == 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA' %}
   <h2 class="font-semibold mb-3 text-amber-800">&#9888; Scrittura Odoo (da suggerimento + spese accessorie)</h2>
   <div class="text-sm text-amber-800 mb-3 p-3 bg-amber-100 border border-amber-300 rounded">
     <strong>Attenzione:</strong> bozza basata su un sotto-insieme di righe
@@ -84,20 +95,54 @@
     420110 per coprire il delta. Verifica MANUALMENTE l'OdA, le righe
     consumate e l'entita' delle spese accessorie prima del posting.
   </div>
+  {% elif a['classification'] == 'MATCH_PARZIALE_OK' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (match parziale: fattura consuma sottoinsieme righe OdA)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    Pattern OdA-ledger: la fattura consuma una o piu' righe libere dell'OdA
+    (tipicamente rate ricorrenti). Le righe selezionate sommano esattamente
+    l'imponibile della fattura. Verifica le righe consumate prima di registrare.
+  </p>
+  {% elif a['classification'] == 'PARZIALE_CUMULATIVO_OK' %}
+  <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (parziale cumulativo OK)</h2>
+  <p class="text-sm text-emerald-700 mb-3">
+    L'OdA ha gia' altre fatture registrate o questa la chiude. Il cumulato resta
+    entro tolleranza dell'OdA. La bozza consumera' le righe residue. Verifica le
+    righe consumate prima di registrare.
+  </p>
+  {% elif a['classification'] == 'DA_VERIFICARE' %}
+  <h2 class="font-semibold mb-3 text-rose-800">&#9888; Scrittura Odoo (DA VERIFICARE - alto rischio)</h2>
+  <div class="text-sm text-rose-800 mb-3 p-3 bg-rose-100 border border-rose-300 rounded">
+    <strong>ATTENZIONE:</strong> la fattura ha scostamenti rispetto all'OdA oltre
+    la tolleranza, o righe non riconosciute. La bozza generata in modo
+    automatico potrebbe avere importi sbagliati. Crea la bozza solo se
+    sai gia' cosa stai facendo, e verifica TUTTO prima del posting.
+    In caso di errore, usa <strong>Rollback bozza</strong>.
+  </div>
+  {% elif a['classification'] == 'CUMULATIVO_ECCEDE' %}
+  <h2 class="font-semibold mb-3 text-rose-800">&#9888; Scrittura Odoo (CUMULATIVO ECCEDE - alto rischio)</h2>
+  <div class="text-sm text-rose-800 mb-3 p-3 bg-rose-100 border border-rose-300 rounded">
+    <strong>ATTENZIONE:</strong> la somma di questa fattura + le altre della run
+    o gia' registrate eccede il totale dell'OdA. Tipicamente significa che
+    occorre creare un nuovo OdA o che ci sono duplicati. La bozza generata
+    consumerebbe ulteriori righe residue dell'OdA. Procedere con cautela
+    e usare <strong>Rollback bozza</strong> in caso di errore.
+  </div>
   {% endif %}
 
   <div id="odoo-write-status" class="text-sm mb-3"></div>
 
   <div class="flex gap-2 flex-wrap">
+    {% if a['classification'] != 'MAPPATURA_AUTOMEZZI' %}
     <button id="btn-create-draft" onclick="createDraft({{ a['id'] }}, '{{ a['classification'] }}')"
             class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 text-sm">
       Crea bozza in Odoo
     </button>
+    {% endif %}
     <button id="btn-rollback" onclick="rollbackDraft({{ a['id'] }})"
             class="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm hidden">
       Rollback bozza
     </button>
-    {% if a['classification'] in ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA') %}
+    {% if a['classification'] in ('AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA', 'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK', 'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
     <button id="btn-check-reception" onclick="checkReception({{ a['id'] }})"
             class="px-4 py-2 bg-sky-600 text-white rounded hover:bg-sky-700 text-sm">
       Verifica ricezione merce
@@ -115,6 +160,128 @@
 
   <div id="reception-status" class="hidden mt-3 p-3 bg-white rounded border border-emerald-200 text-sm"></div>
 </div>
+
+{# === Sezione dedicata Autostrade per l'Italia (IT07516911000) === #}
+{% if a['supplier_vat'] == 'IT07516911000' %}
+<div class="bg-amber-50 border border-amber-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-amber-900">
+    🛣️ Autostrade per l&apos;Italia — flow dedicato
+  </h2>
+  <p class="text-sm text-amber-800 mb-3">
+    Per le fatture Autostrade è disponibile un writer dedicato che gestisce
+    automaticamente lo split <b>Furgoni 100% (420160) / Uso Promiscuo 70% (420840)</b>.
+    Carica il PDF della fattura dal portale Telepass per attivare il calcolo
+    automatico via APPARATI_MAP. Senza PDF, la bozza viene creata con 2 righe
+    a importo 0 (R1 fallback): l&apos;utente inserirà gli importi manualmente.
+  </p>
+
+  <div class="bg-white rounded p-3 border border-amber-200 mb-3">
+    <h3 class="font-semibold text-sm mb-2 text-amber-900">Step 1 — Carica PDF Autostrade</h3>
+    <form id="form-upload-pdf" enctype="multipart/form-data" class="flex items-center gap-2">
+      <input type="file" id="pdf-file" name="pdf" accept=".pdf"
+             class="text-sm border border-amber-300 rounded px-2 py-1 bg-white" />
+      <button type="submit" class="px-4 py-2 bg-amber-600 text-white rounded hover:bg-amber-700 text-sm">
+        Carica PDF
+      </button>
+    </form>
+    <div id="pdf-upload-status" class="text-xs mt-2 text-amber-800"></div>
+    {% if a['pdf_split_furgoni'] is not none %}
+    <div class="mt-3 p-2 bg-amber-100 rounded text-xs">
+      <b>PDF già caricato:</b><br/>
+      Furgoni 420160: € {{ '%.2f' | format(a['pdf_split_furgoni']) }}<br/>
+      Uso Promiscuo 420840: € {{ '%.2f' | format(a['pdf_split_promiscuo']) }}
+      {% if a['pdf_split_warnings'] %}
+      <details class="mt-1"><summary class="cursor-pointer text-amber-900">Warnings</summary>
+        <pre class="text-xs whitespace-pre-wrap mt-1">{{ a['pdf_split_warnings'] }}</pre>
+      </details>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="bg-white rounded p-3 border border-amber-200">
+    <h3 class="font-semibold text-sm mb-2 text-amber-900">Step 2 — Crea bozza dedicata Autostrade</h3>
+    <p class="text-xs text-amber-800 mb-2">
+      Crea il move <code>account.move</code> con conti, IVA, narrazione,
+      OdA e codice cliente pre-popolati. Se il PDF è stato caricato sopra,
+      lo split Furgoni/Promiscuo è già impostato. Altrimenti i 2 importi
+      sono 0 e vanno inseriti manualmente in Odoo.
+    </p>
+    <button id="btn-draft-autostrade" onclick="createDraftAutostrade({{ a['id'] }})"
+            class="px-4 py-2 bg-emerald-700 text-white rounded hover:bg-emerald-800 text-sm">
+      🛣️ Crea bozza Autostrade
+    </button>
+    <div id="autostrade-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
+
+{# === Sezione dedicata Automezzi (7 fornitori noleggio veicoli) === #}
+{% if a['classification'] == 'MAPPATURA_AUTOMEZZI' %}
+<div class="bg-emerald-50 border border-emerald-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-emerald-900">
+    🚗 Automezzi — flow dedicato (consume-POL multi-line)
+  </h2>
+  <p class="text-sm text-emerald-800 mb-3">
+    Per le fatture dei 7 fornitori noleggio (Leasys, Tecnoalt, UnipolRental,
+    Athlon, Arval, ALD, LeasePlan) l&apos;agent applica il pattern consume-POL:
+    ogni riga XML consuma 1 POL libera dell&apos;OdA target. La classificazione
+    fiscale del veicolo (POOL/uso_promiscuo/super_lusso) è risolta dal file
+    <code>Parco Auto.xlsx</code>. Conto contabile e tax_id sono derivati
+    automaticamente da voce + classificazione.
+  </p>
+
+  <div class="bg-white rounded p-3 border border-emerald-200">
+    <h3 class="font-semibold text-sm mb-2 text-emerald-900">Crea bozza Automezzi</h3>
+    <p class="text-xs text-emerald-800 mb-2">
+      Estrae voce (locazione/servizi/tassa), targa e numero contratto da
+      ogni riga XML. Routing OdA per fornitore (singolo o multi-OdA).
+      Riscrive le POL libere "TEST €1" col contenuto reale.
+    </p>
+    <button id="btn-draft-automezzi" onclick="createDraftAutomezzi({{ a['id'] }})"
+            class="px-4 py-2 bg-emerald-700 text-white rounded hover:bg-emerald-800 text-sm">
+      🚗 Crea bozza Automezzi
+    </button>
+    <div id="automezzi-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
+
+{# === Sezione dedicata Telepass canoni (IT09771701001) === #}
+{% if a['supplier_vat'] == 'IT09771701001' %}
+<div class="bg-sky-50 border border-sky-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-sky-900">
+    📡 Telepass S.p.A. — canoni (consume-POL su P03722)
+  </h2>
+  <p class="text-sm text-sky-800 mb-3">
+    Per le fatture canoni Telepass è disponibile un writer dedicato che
+    consuma le POL libere generiche pre-create da Acquisti su P03722,
+    riscrivendole completamente con voce + cc cliente + importo + IVA
+    della singola riga XML. Niente PDF da caricare: i dati sono tutti
+    nell&apos;XML FatturaPA.
+    <br/>Conti contabili routing per voce:
+    <b>Canone</b> → 420840 (70%),
+    <b>Parcheggi</b> → 420160 (100%),
+    <b>Bollo</b> → 490100,
+    <b>Quota associativa</b> → 420840.
+  </p>
+
+  <div class="bg-white rounded p-3 border border-sky-200">
+    <h3 class="font-semibold text-sm mb-2 text-sky-900">Crea bozza Telepass canoni</h3>
+    <p class="text-xs text-sky-800 mb-2">
+      Crea <code>account.move</code> con N righe (1 per riga XML),
+      ognuna collegata a una POL libera di P03722 via
+      <code>purchase_line_id</code>. Le POL vengono riscritte col format
+      utenti (3 righe: voce / Codice cliente / cc).
+    </p>
+    <button id="btn-draft-telepass" onclick="createDraftTelepass({{ a['id'] }})"
+            class="px-4 py-2 bg-sky-700 text-white rounded hover:bg-sky-800 text-sm">
+      📡 Crea bozza Telepass canoni
+    </button>
+    <div id="telepass-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
 
 <script>
 async function refreshStatus(analysisId) {
@@ -140,21 +307,29 @@ async function refreshStatus(analysisId) {
       }).join('');
       statusDiv.innerHTML = `<div class="bg-white rounded p-2">${rows}</div>`;
 
-      // Mostra/nascondi pulsanti — accetto sia create_draft che create_draft_from_oda
+      // Mostra/nascondi pulsanti — accetto tutte le action di creazione bozza
+      const CREATE_ACTIONS = ['create_draft', 'create_draft_from_oda',
+        'create_draft_libera', 'create_draft_autostrade',
+        'create_draft_telepass_canoni', 'create_draft_automezzi'];
       const lastCreate = data.writes.find(w =>
-        (w.action === 'create_draft' || w.action === 'create_draft_from_oda')
-        && w.success && !w.dry_run);
+        CREATE_ACTIONS.includes(w.action) && w.success && !w.dry_run);
       const lastRollback = data.writes.find(w =>
         w.action === 'rollback' && w.success);
+      const btnCreate = document.getElementById('btn-create-draft');
+      const btnRollback = document.getElementById('btn-rollback');
 
       if (lastCreate && (!lastRollback || lastRollback.id < lastCreate.id)) {
-        document.getElementById('btn-create-draft').disabled = true;
-        document.getElementById('btn-create-draft').classList.add('opacity-50', 'cursor-not-allowed');
-        document.getElementById('btn-rollback').classList.remove('hidden');
+        if (btnCreate) {
+          btnCreate.disabled = true;
+          btnCreate.classList.add('opacity-50', 'cursor-not-allowed');
+        }
+        if (btnRollback) btnRollback.classList.remove('hidden');
       } else {
-        document.getElementById('btn-create-draft').disabled = false;
-        document.getElementById('btn-create-draft').classList.remove('opacity-50', 'cursor-not-allowed');
-        document.getElementById('btn-rollback').classList.add('hidden');
+        if (btnCreate) {
+          btnCreate.disabled = false;
+          btnCreate.classList.remove('opacity-50', 'cursor-not-allowed');
+        }
+        if (btnRollback) btnRollback.classList.add('hidden');
       }
     } else {
       statusDiv.innerHTML = '<span class="text-gray-500">Nessuna scrittura registrata</span>';
@@ -165,14 +340,28 @@ async function refreshStatus(analysisId) {
 }
 
 async function createDraft(analysisId, classification) {
+  // Confirm aggiuntivo per categorie a rischio
+  const RISKY = ['DA_VERIFICARE', 'CUMULATIVO_ECCEDE'];
+  if (RISKY.includes(classification)) {
+    const cls = classification.replace(/_/g, ' ');
+    const ok = confirm(
+      '⚠ ATTENZIONE: stai per creare una bozza per una fattura in stato ' + cls + '.\n\n' +
+      'Questa fattura ha scostamenti rispetto all\'OdA o cumulativo eccedente.\n' +
+      'La bozza generata potrebbe avere importi sbagliati.\n\n' +
+      'Procedere comunque? (puoi sempre fare Rollback in caso di errore)');
+    if (!ok) return;
+  }
+
   const btn = document.getElementById('btn-create-draft');
   btn.disabled = true;
   btn.textContent = 'Creazione in corso...';
-  // Endpoint dipende dalla categoria
-  const endpoint = (classification === 'AUTO_VALIDABILE'
-                    || classification === 'MATCH_IMPLICITO'
-                    || classification === 'MATCH_DA_SUGGERIMENTO'
-                    || classification === 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA')
+  // Endpoint dipende dalla categoria: tutte quelle con OdA matchato usano draft_from_oda;
+  // MAPPATURA_FORNITORE_FISSO usa il path classico create_draft.
+  const FROM_ODA = ['AUTO_VALIDABILE', 'MATCH_IMPLICITO',
+                    'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA',
+                    'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
+                    'DA_VERIFICARE', 'CUMULATIVO_ECCEDE'];
+  const endpoint = FROM_ODA.includes(classification)
     ? `/api/odoo_write/draft_from_oda/${analysisId}`
     : `/api/odoo_write/create_draft/${analysisId}`;
   try {
@@ -191,6 +380,136 @@ async function createDraft(analysisId, classification) {
     refreshStatus(analysisId);
   }
 }
+
+// === Autostrade-dedicated handlers ===
+{% if a['supplier_vat'] == 'IT07516911000' %}
+document.getElementById('form-upload-pdf').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const fileInput = document.getElementById('pdf-file');
+  const statusDiv = document.getElementById('pdf-upload-status');
+  if (!fileInput.files || !fileInput.files[0]) {
+    statusDiv.innerHTML = '<span class="text-red-600">Seleziona un PDF</span>';
+    return;
+  }
+  const fd = new FormData();
+  fd.append('pdf', fileInput.files[0]);
+  statusDiv.innerHTML = '<span class="text-gray-600">Upload in corso...</span>';
+  try {
+    const r = await fetch('/api/upload_pdf/{{ a["id"] }}', {
+      method: 'POST',
+      body: fd,
+    });
+    const data = await r.json();
+    if (data.success) {
+      statusDiv.innerHTML =
+        `<span class="text-green-700">✓ PDF caricato. ` +
+        `Furgoni € ${data.imponibile_furgoni.toFixed(2)} | ` +
+        `Promiscuo € ${data.imponibile_promiscuo.toFixed(2)}` +
+        (data.warnings.length ? ` <span class="text-amber-700">[${data.warnings.length} warning]</span>` : '') +
+        `</span>`;
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">${data.error}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+  }
+});
+
+async function createDraftAutostrade(analysisId) {
+  const btn = document.getElementById('btn-draft-autostrade');
+  const statusDiv = document.getElementById('autostrade-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-gray-600">Creazione in corso...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_autostrade/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? ' [DRY_RUN]' : '';
+      statusDiv.innerHTML = `<span class="text-green-700">✓ Bozza creata${dr}` +
+        (data.move_id ? ` (move_id=${data.move_id})` : '') + `</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error_message || data.error || 'errore sconosciuto'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🛣️ Crea bozza Autostrade';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
+
+// === Automezzi-dedicated handler ===
+{% if a['classification'] == 'MAPPATURA_AUTOMEZZI' %}
+async function createDraftAutomezzi(analysisId) {
+  const btn = document.getElementById('btn-draft-automezzi');
+  const statusDiv = document.getElementById('automezzi-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-emerald-700">Invio richiesta...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_automezzi/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? '<span class="text-gray-500">(DRY_RUN)</span> ' : '';
+      const moveLink = data.move_id ? `<b>move_id=${data.move_id}</b>` : '';
+      const polInfo = data.po_line_id ? ` POL primaria=${data.po_line_id}` : '';
+      const extras = data.extra_po_lines && data.extra_po_lines.length > 0
+        ? ` + ${data.extra_po_lines.length} altre POL` : '';
+      statusDiv.innerHTML = `<span class="text-emerald-700">✓ Bozza creata. ${dr}${moveLink}${polInfo}${extras}</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error_message || data.error || 'Errore'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🚗 Crea bozza Automezzi';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
+
+// === Telepass-dedicated handler ===
+{% if a['supplier_vat'] == 'IT09771701001' %}
+async function createDraftTelepass(analysisId) {
+  const btn = document.getElementById('btn-draft-telepass');
+  const statusDiv = document.getElementById('telepass-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-sky-700">Invio richiesta...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_telepass_canoni/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? '<span class="text-gray-500">(DRY_RUN)</span> ' : '';
+      const moveLink = data.move_id ? `<b>move_id=${data.move_id}</b>` : '';
+      const polInfo = data.po_line_id
+        ? ` POL primaria=${data.po_line_id}` : '';
+      const extras = data.extra_po_lines && data.extra_po_lines.length > 0
+        ? ` + ${data.extra_po_lines.length} altre POL` : '';
+      statusDiv.innerHTML = `<span class="text-emerald-700">✓ Bozza creata. ${dr}${moveLink}${polInfo}${extras}</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error_message || data.error || 'Errore sconosciuto'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📡 Crea bozza Telepass canoni';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
 
 async function rollbackDraft(analysisId) {
   if (!confirm('Sicuro di voler cancellare la bozza in Odoo? Questa operazione cancellerà il record account.move e ripristinerà la riga OdA.')) {
@@ -326,30 +645,10 @@ async function forceDraftLibera(analysisId) {
 </script>
 {% endif %}
 
-{% if a['classification'] in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
-                               'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
-<div class="bg-sky-50 border border-sky-200 rounded-lg p-5 mb-6">
-  <h2 class="font-semibold mb-3 text-sky-800">Verifica magazzino</h2>
-  <p class="text-sm text-sky-700 mb-3">
-    Per questa categoria la creazione bozza non e' attivata in automatico,
-    ma puoi verificare lo stato della ricezione delle merci sull'OdA matchato
-    e generare una email per il magazzino se mancano ricezioni.
-  </p>
-
-  <div class="flex gap-2 flex-wrap">
-    <button id="btn-check-reception-only" onclick="checkReceptionOnly({{ a['id'] }})"
-            class="px-4 py-2 bg-sky-600 text-white rounded hover:bg-sky-700 text-sm">
-      Verifica ricezione merce
-    </button>
-    <a href="/api/odoo_write/email_magazzino_single/{{ a['id'] }}" target="_blank"
-       class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 text-sm">
-      Email magazzino
-    </a>
-  </div>
-
-  <div id="reception-status-only" class="hidden mt-3 p-3 bg-white rounded border border-sky-200 text-sm"></div>
-</div>
-
+{# Blocco "Verifica magazzino" rimosso: queste 4 categorie ora hanno il blocco
+   completo "Scrittura Odoo" sopra (con Crea bozza, Rollback, Verifica ricezione
+   e Email magazzino) come le altre. #}
+{% if false %}
 <script>
 async function checkReceptionOnly(analysisId) {
   const btn = document.getElementById('btn-check-reception-only');

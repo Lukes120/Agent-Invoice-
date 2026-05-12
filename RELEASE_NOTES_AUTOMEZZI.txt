@@ -1,0 +1,215 @@
+================================================================================
+RELEASE NOTES — Categoria Automezzi (7 fornitori noleggio)
+Deploy 08/05/2026 (notte) — post deploy Telepass canoni della sera
+Odoo Invoice Agent — Ecotel Italia
+================================================================================
+
+PRE-CONDIZIONE
+--------------
+Questo deploy assume che siano GIÀ stati applicati sul server:
+- Deploy Autostrade del mattino 08/05 (auto_write Autostrade=True,
+  schema DB con extra_po_lines_json, mappa apparati 75 entries)
+- Deploy Telepass canoni della sera 08/05 (mappatura IT09771701001)
+
+Questo è il TERZO e ultimo deploy della giornata 08/05/2026.
+
+
+COSA AGGIUNGE QUESTO DEPLOY
+================================================================================
+
+Nuova categoria dashboard `MAPPATURA_AUTOMEZZI` per i 7 fornitori
+noleggio veicoli del file Parco Auto.xlsx:
+
+  - Leasys Italia (IT06714021000) → P03021
+  - Tecnoalt S.r.l. (IT05580391000) → multi-OdA per veicolo
+  - UnipolRental (IT03740811207) → multi-OdA per cc/contratto
+  - Athlon Car Lease (IT10641441000) → P04797 (nuovo 27/04)
+  - Arval Service Lease (IT04911190488) → P03405
+  - ALD Automotive (IT01924961004) → P03053
+  - LeasePlan (IT02615080963) → da censire (auto_write=False)
+
+Box dedicato verde 🚗 sulla pagina dettaglio + filtro categoria
++ bulk button.
+
+
+PATTERN ARCHITETTURALE
+================================================================================
+
+Pattern consume-POL multi-line con riscrittura totale POL libere generic
+"TEST €1" pre-create da Acquisti su ogni OdA-ledger annuale.
+
+Per ogni riga XML della fattura, l'agent:
+  1. Identifica voce (locazione/servizi/tassa) dalla descrizione
+  2. Estrae targa veicolo (regex sulla desc + fallback CodiceArticolo)
+  3. Estrae numero contratto (DatiContratto.IdDocumento o regex desc)
+  4. Lookup in PARCO_BY_TARGA / PARCO_BY_CONTRATTO →
+     classificazione (POOL/uso_promiscuo/super_lusso)
+  5. Conto contabile = CONTO_AUTOMEZZI[(voce, classificazione)]
+  6. Tax_id = TAX_AUTOMEZZI[vat][(voce, classificazione)]
+  7. Prende prima POL libera FIFO sull'OdA target
+  8. Riscrive completamente la POL: name = desc XML originale,
+     price = importo XML, taxes = tax target, qty_received=1
+  9. Crea move_line con purchase_line_id collegato
+
+Routing OdA:
+  - Multi-contratto (Tecnoalt, UnipolRental): mapping_entry.contratti
+    + fallback oda_default
+  - Singolo (altri): mapping_entry.oda_fisso
+
+
+CONTI CONTABILI E TAX (id Odoo Ecotel verificati)
+================================================================================
+
+Conti (CONTO_AUTOMEZZI):
+  430210 (id 398) — locazioni 100% (POOL)
+  430220 (id 399) — locazioni 70% (uso_promiscuo)
+  430225 (id 1119) — locazioni 20% (super_lusso)
+  430230 (id 400) — servizi su locazioni 100%
+  430240 (id 401) — servizi 70%
+  490300 (id 161) — tassa di possesso 100%
+  490410 (id 1129) — tassa 70%
+
+Tax_id per fornitore (TAX_AUTOMEZZI):
+  Leasys/ALD/Arval/UnipolRental/LeasePlan: tax 6 (22% G — locazione operativa)
+  Tecnoalt: tax 11 (22% S — noleggio attrezzature)
+  Athlon: tax 11 standard, tax 73 (IVA indetraibile 60%) per super_lusso
+  Bollo/tasse: tax 47 (N1 escluse) per tutti
+
+Pattern dedotto da analisi cross-tab Q1 2026 su 200+ move_line storiche.
+
+
+PARCO AUTO COME SSOT
+================================================================================
+
+File `input/Parco Auto.xlsx` è il SSOT per la classificazione fiscale
+veicoli. Generator forward-compat:
+  - Se presenti, legge colonne nuove "STATO" e "CLASSIFICAZIONE FISCALE"
+  - Altrimenti deduce da colonna "POOL/USO PROMISCUO" e "DATA FINE CONTRATTO"
+
+Output: `config/parco_auto_mapping.py` con PARCO_BY_TARGA (50 targhe)
+e PARCO_BY_CONTRATTO (63 contratti).
+
+Per rigenerare:
+    python scripts/generate_parco_auto_mapping.py
+
+
+PRE-REQUISITO ACQUISTI
+================================================================================
+
+Stato POL libere su OdA attivi (verificato 08/05/2026, vedi
+output/report_oda_automezzi_*.xlsx):
+
+  Leasys P03021:        31 POL libere
+  Tecnoalt 8 OdA:       144 POL libere (P04617-P04664)
+  UnipolRental 3 OdA:   50 POL libere (P03363/P03365/P03495)
+  Athlon P03798/P04797: 14 POL libere
+  Arval P03405:         14 POL libere
+  ALD P03053:           12 POL libere
+  LeasePlan:            0 (NESSUN OdA attivo)
+
+  TOTALE: 245 POL libere
+
+⚠ Volume mensile atteso ~60-65 POL (Leasys 30, Tecnoalt 12,
+  UnipolRental 10, ALD 4, Athlon 4, Arval 2). Copertura ~3-4 mesi.
+  Ricarica POL on-demand quando l'agent segnala
+  "POL libere insufficienti su {oda}".
+
+
+FILE INCLUSI NELLO ZIP
+================================================================================
+
+Modificati:
+  - config/rules.py                         (+ MAPPATURA_AUTOMEZZI, CONTO, TAX)
+  - core/odoo_writer.py                     (+ create_bozza_automezzi + helper)
+  - core/fatturapa_analyzer.py              (+ classifier extension)
+  - Agent Invoices/app.py                   (+ endpoint draft_automezzi
+                                             + lista analyses + rollback whitelist)
+  - Agent Invoices/templates/invoices.html  (+ filtro AUTOMEZZI + bulk)
+  - Agent Invoices/templates/invoice_detail.html  (+ box verde Automezzi)
+
+Nuovi:
+  - scripts/generate_parco_auto_mapping.py  (generator SSOT)
+  - config/parco_auto_mapping.py            (auto-generato, 50 targhe + 63 contratti)
+  - scripts/report_oda_automezzi.py         (utility per reportistica)
+
+
+PROCEDURA DEPLOY
+================================================================================
+
+1. Backup precauzionale:
+     Copy-Item -Path "C:\odoo_apps\invoice_agent" `
+               -Destination "C:\odoo_apps\invoice_agent_backup_20260508_preautomezzi" `
+               -Recurse
+
+2. Fermare il webapp.
+
+3. Estrarre lo zip:
+     $ProgressPreference = 'SilentlyContinue'
+     Expand-Archive -Path "$env:USERPROFILE\Desktop\deploy_server.zip" `
+                    -DestinationPath "C:\odoo_apps\invoice_agent\" -Force
+
+4. NESSUNA nuova dipendenza pip da installare.
+
+5. NESSUNA migration DB (extra_po_lines_json già presente).
+
+6. Avviare webapp:
+     python "Agent Invoices/app.py"
+
+7. Test reale: lancia una run dell'agent (o aspetta arrivo nuove fatture
+   automezzi via SDI), poi vai sul filtro `MAPPATURA_AUTOMEZZI`:
+   - Apri 1 fattura per fornitore (idealmente piccola)
+   - Click "Crea bozza Automezzi" sul box verde
+   - Verifica su Odoo: bozza creata, POL aggiornata, purchase_line_id
+     collegato, attachment registered=True
+
+8. Bulk: una volta validato, click "Crea bozze Automezzi" sulla pagina
+   `/invoices?class=MAPPATURA_AUTOMEZZI`.
+
+
+AUTO-WRITE
+================================================================================
+
+Tutti i 6 fornitori con OdA attivi partono con auto_write_enabled=True
+direttamente (modalità veloce, come deploy Autostrade del mattino).
+LeasePlan resta False finché non c'è OdA aperto.
+
+In caso di problemi, RIPORTARE A FALSE in config/rules.py riga ~620:
+    'auto_write_enabled': False,
+e riavviare webapp.
+
+
+LIMITAZIONI NOTE
+================================================================================
+
+1. Tecnoalt: targa veicolo è in <CodiceArticolo><TARGA>, non in
+   descrizione. L'agent attualmente la cerca solo nella descrizione
+   → fallback "uso_promiscuo" conservativo. Le fatture Tecnoalt vengono
+   create correttamente ma classificate sempre uso_promiscuo invece
+   di POOL. Da migliorare in iterazione successiva.
+
+2. UnipolRental multi-origin (es. fatture con "P03495,P03365"): il writer
+   raggruppa per OdA target dedotto dal numero contratto della singola
+   riga. Da verificare empiricamente sulla prima fattura test.
+
+3. ALD: il numero contratto in ALD XML è in <DatiContratto> con
+   <RiferimentoNumeroLinea>. Il writer attuale prende il primo contratto
+   trovato come fallback per tutte le righe, NON per linea. Funziona
+   se la fattura ha 1 contratto principale (caso comune ALD).
+
+4. LeasePlan: nessun OdA attivo, auto_write=False. Quando arriverà la
+   prima fattura, Acquisti dovrà aprire un OdA + ~45 POL TEST per 9 mesi.
+
+
+ROLLBACK
+================================================================================
+
+Se qualcosa va storto su una bozza Automezzi:
+- Dalla dashboard, "Rollback bozza" sulla fattura
+- Ripristina account.move + tutte le POL consumate (1 o N) ai
+  valori originali (TEST/€1/tax=11/qty=0)
+- Schema audit: extra_po_lines_json già esistente
+
+
+CONTATTI
+================================================================================
+Per chiarimenti: Luca Ranalletta (lranalletta@ecotelitalia.it)

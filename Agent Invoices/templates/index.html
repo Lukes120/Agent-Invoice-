@@ -113,6 +113,12 @@
     <a href="/invoices?class=MAPPATURA_FORNITORE_FISSO" class="text-xs text-emerald-600 hover:underline">Dettaglio →</a>
   </div>
 
+  <div class="bg-white rounded-lg shadow p-4 border-l-4 border-emerald-500">
+    <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Automezzi 🚗</div>
+    <div class="text-3xl font-bold text-emerald-600 mt-1">{{ last_run.mappatura_automezzi or 0 }}</div>
+    <a href="/invoices?class=MAPPATURA_AUTOMEZZI" class="text-xs text-emerald-600 hover:underline">Dettaglio →</a>
+  </div>
+
   <div class="bg-white rounded-lg shadow p-4 border-l-4 border-odoo-500">
     <div class="text-xs text-gray-500 uppercase font-semibold tracking-wide">Senza OdA (Fase 3)</div>
     <div class="text-3xl font-bold text-odoo-600 mt-1">{{ last_run.no_oda }}</div>

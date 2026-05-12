@@ -32,6 +32,12 @@
       Crea bozze note di credito (TD04)
     </button>
     {% endif %}
+    {% if filters.get('class') == 'MAPPATURA_AUTOMEZZI' %}
+    <button id="btn-bulk-automezzi" onclick="bulkCreateDraftsAutomezzi()"
+            class="text-sm bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-lg">
+      &#128663; Crea bozze Automezzi
+    </button>
+    {% endif %}
     {% if filters.get('class') == 'AUTO_VALIDABILE' %}
     <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', 'AUTO_VALIDABILE')"
             class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
@@ -104,8 +110,36 @@
       Email magazzino
     </a>
     {% endif %}
-    {% if filters.get('class') in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK',
-                                    'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
+    {# Categorie OK: MATCH_PARZIALE_OK + PARZIALE_CUMULATIVO_OK — pulsanti standard #}
+    {% if filters.get('class') in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK') %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDrafts('TD01', 'oda', '{{ filters.get('class') }}')"
+            class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDrafts('TD04', 'oda', '{{ filters.get('class') }}')"
+            class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg">
+      Crea bozze note di credito (TD04)
+    </button>
+    <button id="btn-check-receptions" onclick="checkPendingReceptions('{{ filters.get('class') }}')"
+            class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
+      Verifica ricezioni mancanti
+    </button>
+    <a href="/api/odoo_write/email_magazzino/{{ run_id }}?classification={{ filters.get('class') }}" target="_blank"
+       class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg">
+      Email magazzino
+    </a>
+    {% endif %}
+
+    {# Categorie a rischio: DA_VERIFICARE + CUMULATIVO_ECCEDE — confirm JS prima del bulk create #}
+    {% if filters.get('class') in ('DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
+    <button id="btn-bulk-fatture" onclick="bulkCreateDraftsWarning('TD01', 'oda', '{{ filters.get('class') }}')"
+            class="text-sm bg-amber-700 hover:bg-amber-800 text-white px-4 py-2 rounded-lg">
+      &#9888; Crea bozze fatture (TD01)
+    </button>
+    <button id="btn-bulk-nc" onclick="bulkCreateDraftsWarning('TD04', 'oda', '{{ filters.get('class') }}')"
+            class="text-sm bg-rose-700 hover:bg-rose-800 text-white px-4 py-2 rounded-lg">
+      &#9888; Crea bozze note di credito (TD04)
+    </button>
     <button id="btn-check-receptions" onclick="checkPendingReceptions('{{ filters.get('class') }}')"
             class="text-sm bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg">
       Verifica ricezioni mancanti
@@ -210,6 +244,8 @@
               <span class="badge badge-blue">CON_SUGGERIMENTI</span>
             {% elif cls == 'MAPPATURA_FORNITORE_FISSO' %}
               <span class="badge badge-green">FORNITORE_FISSO</span>
+            {% elif cls == 'MAPPATURA_AUTOMEZZI' %}
+              <span class="badge badge-green">AUTOMEZZI &#128663;</span>
             {% elif cls == 'PARZIALE_CUMULATIVO_OK' %}
               <span class="badge badge-green">PARZIALE_OK</span>
             {% elif cls == 'TRASPORTO_OK' %}
@@ -256,6 +292,22 @@
 </div>
 
 <script>
+async function bulkCreateDraftsWarning(tipoDoc, mode, classification) {
+  // Wrapper di sicurezza per categorie a rischio (DA_VERIFICARE / CUMULATIVO_ECCEDE).
+  // Mostra un confirm aggiuntivo con avviso esplicito prima di delegare a bulkCreateDrafts.
+  const cls = (classification || '').replace(/_/g, ' ');
+  const label = tipoDoc === 'TD01' ? 'fatture' : 'note di credito';
+  const ok = confirm(
+    '⚠ ATTENZIONE: stai per creare bozze AUTOMATICHE per ' + label +
+    ' in stato ' + cls + '.\n\n' +
+    'Queste fatture hanno scostamenti rispetto all\'OdA o cumulativo eccedente.\n' +
+    'La bozza generata potrebbe avere importi sbagliati.\n\n' +
+    'Procedere comunque? (puoi sempre fare Rollback bulk in caso di errore)'
+  );
+  if (!ok) return;
+  return bulkCreateDrafts(tipoDoc, mode, classification);
+}
+
 async function bulkCreateDrafts(tipoDoc, mode, classification) {
   const label = tipoDoc === 'TD01' ? 'fatture' : 'note di credito';
   if (!confirm(`Creare bozze per tutte le ${label} della run?`)) return;
@@ -342,6 +394,94 @@ async function bulkCreateDrafts(tipoDoc, mode, classification) {
     btn.classList.remove('opacity-50', 'cursor-not-allowed');
   }
 }
+
+async function bulkCreateDraftsAutomezzi() {
+  if (!confirm('Creare bozze per tutte le fatture Automezzi della run?')) return;
+  const btn = document.getElementById('btn-bulk-automezzi');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Creazione in corso...';
+  btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+  const resultDiv = document.getElementById('bulk-result');
+  const contentDiv = document.getElementById('bulk-result-content');
+  resultDiv.classList.remove('hidden');
+  contentDiv.innerHTML = '<span class="text-gray-500">Elaborazione bozze Automezzi...</span>';
+
+  // Recupero le analisi MAPPATURA_AUTOMEZZI della run e chiamo l'endpoint
+  // draft_automezzi per ognuna in sequenza (no concurrency per evitare
+  // race su POL libere).
+  try {
+    const listResp = await fetch(`/api/run/{{ run_id }}/analyses?classification=MAPPATURA_AUTOMEZZI`);
+    const listData = await listResp.json();
+    const analyses = (listData && listData.analyses) || [];
+    if (!analyses.length) {
+      contentDiv.innerHTML = '<span class="text-gray-500">Nessuna analisi MAPPATURA_AUTOMEZZI in questa run.</span>';
+      btn.textContent = origText;
+      btn.disabled = false;
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+      return;
+    }
+    let created = 0, skipped = 0, errors = 0;
+    const details = [];
+    for (const a of analyses) {
+      try {
+        const r = await fetch(`/api/odoo_write/draft_automezzi/${a.id}`, {method: 'POST'});
+        const data = await r.json();
+        if (data.success) {
+          created++;
+          details.push({id: a.id, status: 'created', move_id: data.move_id});
+        } else {
+          errors++;
+          details.push({id: a.id, status: 'error', error: data.error_message || data.error});
+        }
+      } catch (e) {
+        errors++;
+        details.push({id: a.id, status: 'error', error: String(e)});
+      }
+    }
+    let html = `<div class="grid grid-cols-3 gap-3 mb-3">
+      <div class="text-center p-2 bg-emerald-50 rounded">
+        <div class="text-lg font-bold text-emerald-700">${created}</div>
+        <div class="text-xs text-gray-500">Create</div>
+      </div>
+      <div class="text-center p-2 bg-gray-50 rounded">
+        <div class="text-lg font-bold text-gray-500">${skipped}</div>
+        <div class="text-xs text-gray-500">Saltate</div>
+      </div>
+      <div class="text-center p-2 bg-red-50 rounded">
+        <div class="text-lg font-bold text-red-600">${errors}</div>
+        <div class="text-xs text-gray-500">Errori</div>
+      </div>
+    </div>`;
+    html += '<div class="space-y-1 max-h-60 overflow-y-auto">';
+    for (const d of details) {
+      const icon = d.status === 'created' ? '&#10003;' : '&#10007;';
+      const color = d.status === 'created' ? 'text-emerald-600' : 'text-red-600';
+      const info = d.move_id ? `move_id=${d.move_id}` : (d.error || '');
+      html += `<div class="flex gap-2 text-xs ${color}">
+        <span>${icon}</span>
+        <span>Analisi #${d.id}</span>
+        <span class="text-gray-400">${info}</span>
+      </div>`;
+    }
+    html += '</div>';
+    contentDiv.innerHTML = html;
+    btn.textContent = `${created} bozze create`;
+    if (created > 0) {
+      btn.classList.add('bg-gray-400');
+    } else {
+      btn.disabled = false;
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+    }
+  } catch (e) {
+    contentDiv.innerHTML = `<span class="text-red-600">Errore: ${e}</span>`;
+    btn.textContent = origText;
+    btn.disabled = false;
+    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+  }
+}
+
 
 async function checkPendingReceptions(classification) {
   classification = classification || 'AUTO_VALIDABILE';

@@ -62,6 +62,18 @@ class FatturaPALine:
     # name della riga OdA Odoo. Usato dal match implicito multi-evidenza.
     codice_articolo_valore: str = ""
     codice_articolo_tipo: str = ""
+    # Tutti i CodiceArticolo della riga (FatturaPA permette N nodi <CodiceArticolo>).
+    # Es. Tecnoalt: ARTICOLO=TEC00000433, TARGA=GP642XH, ID-GV3=1^T, MATRICOLA=12139.
+    # Dict tipo->valore (uppercase tipo). Usato dal writer Automezzi per
+    # estrarre la targa quando non e' nella descrizione testuale.
+    codici_articolo: Dict[str, str] = field(default_factory=dict)
+    # AltriDatiGestionali della riga (FatturaPA permette N nodi).
+    # Es. Athlon: Targa=GS018ZJ, Contratto=787469, Veicolo='BMW X4...',
+    #     Assegnatar='GIOVANNI TARQUINI'.
+    # Es. Tecnoalt: NOTE='UTILIZZATORE ECOTEL ITALIA...'.
+    # Dict tipo (uppercase) -> RiferimentoTesto. Usato dal writer Automezzi
+    # come fonte alternativa per targa/numero contratto.
+    altri_dati_gestionali: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -103,6 +115,11 @@ class FatturaPAData:
 
     # Causale
     causali: List[str] = field(default_factory=list)
+
+    # Codice cliente (estratto da Causale per fatture Telepass-network).
+    # Pattern XML: "<Causale>Codice cliente: NNN</Causale>". Verificato 100%
+    # coverage su 80 XML del periodo dic-2025/apr-2026 nel piano v3.
+    codice_cliente: Optional[str] = None
 
     # Righe
     righe: List[FatturaPALine] = field(default_factory=list)
@@ -314,6 +331,16 @@ def parse_fatturapa_xml(xml_content: str) -> FatturaPAData:
                     if _strip_namespace(child.tag) == 'Causale' and child.text:
                         data.causali.append(child.text.strip())
 
+                # Estrai codice cliente da Causale (pattern Telepass-network).
+                # Es. "Codice cliente: 261713569" → cattura "261713569".
+                # Pattern verificato su 80 XML in v3, 100% coverage.
+                if data.codice_cliente is None:
+                    for c in data.causali:
+                        m = re.search(r'[Cc]odice\s+cliente:?\s*(\d+)', c)
+                        if m:
+                            data.codice_cliente = m.group(1)
+                            break
+
             # === DatiOrdineAcquisto (possono essere multipli) ===
             for oda in _find_all(body, ['DatiGenerali', 'DatiOrdineAcquisto']):
                 id_doc = _get_text(oda, 'IdDocumento')
@@ -366,17 +393,37 @@ def parse_fatturapa_xml(xml_content: str) -> FatturaPAData:
                 line.prezzo_totale = _safe_float(_get_text(linea, 'PrezzoTotale'))
                 line.aliquota_iva = _safe_float(_get_text(linea, 'AliquotaIVA'))
 
-                cod_art = _find_first(linea, ['CodiceArticolo'])
-                if cod_art is not None:
-                    line.codice_articolo_tipo = _get_text(cod_art, 'CodiceTipo')
-                    line.codice_articolo_valore = _get_text(cod_art, 'CodiceValore')
+                # FatturaPA permette N nodi <CodiceArticolo> per riga
+                # (es. Tecnoalt: ARTICOLO + TARGA + ID-GV3 + MATRICOLA).
+                # Salviamo il primo nei campi singolari (retrocompat) e tutti
+                # nel dict codici_articolo per lookup mirati.
+                cod_arts = _find_all(linea, ['CodiceArticolo'])
+                for ca in cod_arts:
+                    tipo = (_get_text(ca, 'CodiceTipo') or '').strip()
+                    valore = (_get_text(ca, 'CodiceValore') or '').strip()
+                    if tipo:
+                        line.codici_articolo[tipo.upper()] = valore
+                if cod_arts:
+                    first = cod_arts[0]
+                    line.codice_articolo_tipo = _get_text(first, 'CodiceTipo') or ''
+                    line.codice_articolo_valore = _get_text(first, 'CodiceValore') or ''
 
-                # OdA a livello di riga
-                for oda_line in _find_all(linea, ['AltriDatiGestionali']):
-                    tipo = _get_text(oda_line, 'TipoDato')
-                    if tipo and 'ORD' in tipo.upper():
-                        val = _get_text(oda_line, 'RiferimentoTesto')
+                # OdA a livello di riga + raccolta tutti gli AltriDatiGestionali
+                # (Athlon usa per Targa/Contratto/Assegnatar/Veicolo;
+                # Tecnoalt usa per NOTE; Trenitalia per Tit. n.X biglietti).
+                for adg in _find_all(linea, ['AltriDatiGestionali']):
+                    tipo = _get_text(adg, 'TipoDato')
+                    # Athlon usa RiferimentoTesto (Targa/Veicolo/Assegnatar),
+                    # RiferimentoNumero (Noleggio/Servizi), RiferimentoData (Mese da/a).
+                    # Salvo qualsiasi valore presente.
+                    val = (_get_text(adg, 'RiferimentoTesto')
+                            or _get_text(adg, 'RiferimentoData')
+                            or _get_text(adg, 'RiferimentoNumero'))
+                    if tipo:
+                        # Salvo nel dict (uppercase tipo per lookup robust)
                         if val:
+                            line.altri_dati_gestionali[tipo.upper().strip()] = val
+                        if 'ORD' in tipo.upper() and val:
                             normalized = _normalize_oda(val)
                             line.riferimenti_oda.extend(normalized)
 

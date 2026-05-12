@@ -29,6 +29,12 @@ class FatturaPAAnalysis:
     invoice_date: str = ""
     invoice_total: float = 0.0
 
+    # Data di creazione del record fatturapa.attachment.in in Odoo, equivalente
+    # alla data di ricezione dallo SdI. Usata dai writer per popolare la
+    # 'data contabile' (`account.move.date`) e la 'data competenza IVA'
+    # (`l10n_it_vat_settlement_date`). Formato Odoo datetime: 'YYYY-MM-DD HH:MM:SS'.
+    attachment_create_date: str = ""
+
     # Dati estratti dall'XML
     xml_data: Optional[FatturaPAData] = None
     raw_xml: str = ""  # XML grezzo, usato da odoo_writer per estrazioni aggiuntive
@@ -172,6 +178,7 @@ class FatturaPAAnalyzer:
             invoice_total=float(attachment.get('invoices_total', 0) or 0),
             invoice_date=attachment.get('invoices_date', '') or '',
             odoo_inconsistencies=attachment.get('inconsistencies', '') or '',
+            attachment_create_date=str(attachment.get('create_date') or ''),
         )
 
         supplier = attachment.get('xml_supplier_id')
@@ -341,7 +348,8 @@ class FatturaPAAnalyzer:
             # PRIMA dei suggerimenti: la mappatura è più affidabile.
             if self.supplier_mapping_enabled and self.supplier_mapping:
                 self._try_supplier_fixed_mapping(analysis)
-                if analysis.classification == "MAPPATURA_FORNITORE_FISSO":
+                if analysis.classification in ("MAPPATURA_FORNITORE_FISSO",
+                                                "MAPPATURA_AUTOMEZZI"):
                     return
 
             # Sotto-caso: SUGGERIMENTI - cerco OdA aperti del fornitore
@@ -480,21 +488,49 @@ class FatturaPAAnalyzer:
         # ==== CLASSIFICAZIONE ====
         # Caso più semplice: fattura singola = OdA
         if abs(analysis.total_diff) < 0.01:
-            analysis.classification = "AUTO_VALIDABILE"
-            msg = f"OdA {po_name}: imponibile identico (€{inv_untaxed:.2f})"
             if keyword_count > 0:
-                msg += f" + {keyword_count} righe spese accessorie"
-            analysis.actions_suggested.append(msg + ". Registrare.")
+                # Pattern Sonepar/RemaTarlazzi: merci quadrano con OdA, ma la
+                # fattura ha N righe spese accessorie extra. Classifico come
+                # MATCH_PARZIALE_OK così create_bozza_da_oda_matched chiama
+                # _add_extra_pol_to_oda per aggiungere le POL accessorie sull'OdA
+                # (conto/product da EXTRA_POL_MAPPING_ECOTEL).
+                analysis.classification = "MATCH_PARZIALE_OK"
+                analysis.partial_extra_lines = self._build_extra_lines_from_keyword_matches(analysis)
+                analysis.partial_extra_total = keyword_amount
+                analysis.partial_match_applied = True
+                analysis.actions_suggested.append(
+                    f"OdA {po_name}: merci €{inv_untaxed-keyword_amount:.2f} "
+                    f"matcha l'OdA + {keyword_count} righe spese accessorie "
+                    f"€{keyword_amount:.2f} aggiunte come POL extra. Registrare."
+                )
+            else:
+                analysis.classification = "AUTO_VALIDABILE"
+                analysis.actions_suggested.append(
+                    f"OdA {po_name}: imponibile identico (€{inv_untaxed:.2f}). Registrare."
+                )
             return
 
         # Fattura singola entro tolleranza
         if within_absolute or within_percent:
-            analysis.classification = "AUTO_VALIDABILE"
-            analysis.actions_suggested.append(
-                f"OdA {po_name}: imponibile €{inv_untaxed:.2f} vs OdA €{po_untaxed:.2f}, "
-                f"diff €{analysis.total_diff:+.2f} ({analysis.total_diff_percent:.1f}%) "
-                f"entro tolleranza. Registrare."
-            )
+            if keyword_count > 0:
+                analysis.classification = "MATCH_PARZIALE_OK"
+                analysis.partial_extra_lines = self._build_extra_lines_from_keyword_matches(analysis)
+                analysis.partial_extra_total = keyword_amount
+                analysis.partial_match_applied = True
+                analysis.actions_suggested.append(
+                    f"OdA {po_name}: merci €{inv_untaxed-keyword_amount:.2f} vs "
+                    f"OdA €{po_untaxed:.2f}, diff €{analysis.total_diff:+.2f} "
+                    f"({analysis.total_diff_percent:.1f}%) entro tolleranza. "
+                    f"{keyword_count} righe spese accessorie €{keyword_amount:.2f} "
+                    f"aggiunte come POL extra. Registrare."
+                )
+            else:
+                analysis.classification = "AUTO_VALIDABILE"
+                analysis.actions_suggested.append(
+                    f"OdA {po_name}: imponibile €{inv_untaxed:.2f} vs OdA €{po_untaxed:.2f}, "
+                    f"diff €{analysis.total_diff:+.2f} ({analysis.total_diff_percent:.1f}%) "
+                    f"entro tolleranza. Registrare."
+                )
             return
 
         # Ci sono altre fatture esistenti sull'OdA? Applico logica cumulativa
@@ -565,6 +601,36 @@ class FatturaPAAnalyzer:
                 f"Verificare prezzi/quantità con il fornitore "
                 f"(nessuna altra fattura trovata sullo stesso OdA)."
             )
+
+    def _build_extra_lines_from_keyword_matches(self, analysis: 'FatturaPAAnalysis') -> List[Dict]:
+        """
+        Costruisce la struttura partial_extra_lines (consumata dal writer in
+        _add_extra_pol_to_oda) a partire dalle line_matches di tipo KEYWORD,
+        risalendo alle FatturaPALine originali in analysis.xml_data.righe per
+        recuperare i campi mancanti (aliquota_iva, unita_misura, codice_articolo).
+
+        Schema identico a quello popolato in _try_partial_match.
+        """
+        xml_lines_by_id = {l.numero_linea: l for l in (analysis.xml_data.righe or [])}
+        extra = []
+        for lm in analysis.line_matches:
+            if lm.match_type != 'KEYWORD':
+                continue
+            line_num = lm.invoice_line.get('id')
+            original = xml_lines_by_id.get(line_num)
+            if not original:
+                continue
+            extra.append({
+                'descrizione': original.descrizione,
+                'quantita': original.quantita,
+                'prezzo': original.prezzo_totale,
+                'prezzo_totale': original.prezzo_totale,
+                'prezzo_unitario': original.prezzo_unitario,
+                'aliquota_iva': original.aliquota_iva,
+                'unita_misura': original.unita_misura,
+                'codice_articolo_valore': getattr(original, 'codice_articolo_valore', ''),
+            })
+        return extra
 
     def _try_oda_ledger_subset_match(self, analysis: 'FatturaPAAnalysis',
                                       inv_untaxed: float, po_untaxed: float) -> bool:
@@ -1061,7 +1127,12 @@ class FatturaPAAnalyzer:
                 {
                     'descrizione': r.descrizione,
                     'quantita': r.quantita,
-                    'prezzo': r.prezzo_totale,
+                    'prezzo': r.prezzo_totale,        # legacy, retrocompat
+                    'prezzo_totale': r.prezzo_totale, # consumato dal writer
+                    'prezzo_unitario': r.prezzo_unitario,
+                    'aliquota_iva': r.aliquota_iva,
+                    'unita_misura': r.unita_misura,
+                    'codice_articolo_valore': getattr(r, 'codice_articolo_valore', ''),
                 } for r in extra_lines
             ]
             analysis.partial_extra_total = sum(float(r.prezzo_totale)
@@ -1402,6 +1473,25 @@ class FatturaPAAnalyzer:
         supplier_vat = (analysis.xml_data.cedente_partita_iva or '').strip().upper()
         if not supplier_vat:
             return
+
+        # === Check Automezzi (categoria distinta) ===
+        # Se la P.IVA è di un fornitore noleggio veicoli del file Parco Auto,
+        # classifica come MAPPATURA_AUTOMEZZI e salta il flusso fornitore fisso.
+        try:
+            from config.rules import (AUTOMEZZI_VATS, MAPPATURA_AUTOMEZZI,
+                                        MAPPATURA_AUTOMEZZI_ATTIVA)
+            if MAPPATURA_AUTOMEZZI_ATTIVA and supplier_vat in AUTOMEZZI_VATS:
+                automezzi_entry = MAPPATURA_AUTOMEZZI[supplier_vat]
+                nome = automezzi_entry.get('nome', supplier_vat)
+                analysis.classification = "MAPPATURA_AUTOMEZZI"
+                analysis.actions_suggested.append(
+                    f"Mappatura automezzi: {nome}. Categoria 'Automezzi', "
+                    f"writer dedicato consume-POL multi-line."
+                )
+                return
+        except ImportError:
+            # Modulo non ancora disponibile (retrocompat)
+            pass
 
         # Normalizzo: la chiave può avere prefisso IT o no
         mapping_entry = self.supplier_mapping.get(supplier_vat)

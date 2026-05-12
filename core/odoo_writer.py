@@ -2555,10 +2555,22 @@ class OdooWriter:
                 'BOLLO', 'TASSA DI PROPRIETA', 'TASSA AUTOMOBILISTICA',
                 'RIADDEBITO TASSE', 'SUPERBOLLO', 'TASSA DI POSSESSO')):
             return 'tassa'
-        # Servizi (specifico)
+        # Servizi (specifico) — incluse spese notifica/gestione multe
+        # (riaddebito noleggiatore: NLT non fattura mai la sanzione stessa,
+        # solo il fee di notifica/gestione → conto 430230/430240)
         if any(tok in d for tok in (
                 'GESTIONE E SERVIZI', 'CANONE SERVIZIO', 'CANONE SERVIZI',
-                'CANONESERVIZIO')):
+                'CANONESERVIZIO',
+                'NOTIFICA MULTA', 'NOTIFICA MULTE', 'NOTIFICA INFRAZIONE',
+                'NOTIFICA INFRAZIONI', 'NOTIFICA SANZIONE', 'NOTIFICA SANZIONI',
+                'GESTIONE MULTA', 'GESTIONE MULTE',
+                'GESTIONE INFRAZIONE', 'GESTIONE INFRAZIONI',
+                'GESTIONE SANZIONE', 'GESTIONE SANZIONI',
+                'GESTIONE PRATICA MULTA', 'GESTIONE PRATICHE MULTA',
+                'DIRITTI DI NOTIFICA', 'SPESE NOTIFICA',
+                'RIADDEBITO MULTA', 'RIADDEBITO MULTE',
+                'RIADDEBITO NOTIFICA', 'RIADDEBITO SANZION',
+                'RIADDEBITO INFRAZION')):
             return 'servizi'
         # Default = locazione
         return 'locazione'
@@ -2581,6 +2593,234 @@ class OdooWriter:
         if voce == 'spese_incasso':
             return is_incasso_pol
         return not is_incasso_pol
+
+    @staticmethod
+    def _classify_voce_automezzi_full(riga) -> str:
+        """Come `_classify_voce_automezzi` ma con fallback su aliquota IVA.
+
+        Caso d'uso: Leasys (e simili) emettono righe XML con descrizione MUTA
+        per le tasse di proprieta — solo targa+modello, es. 'GL898ZH PANDA 1.0
+        FireFly 70cv'. Il classifier basato su keyword non puo' distinguere
+        bollo da canone in questi casi.
+
+        Indizio strutturale: i bolli sono N1 escluse art.15 (aliquota 0%),
+        mentre i canoni sono al 22%. Se la desc cade nel default 'locazione'
+        e l'aliquota XML e' 0%, sovrascrivo a 'tassa'.
+        """
+        desc = riga.descrizione or ''
+        voce = OdooWriter._classify_voce_automezzi(desc)
+        # Solo override quando classifier ha messo 'locazione' di default.
+        # Le voci esplicite (tassa, servizi, spese_incasso) restano.
+        if voce != 'locazione':
+            return voce
+        try:
+            aliquota = float(getattr(riga, 'aliquota_iva', 0) or 0)
+        except (TypeError, ValueError):
+            return voce
+        if aliquota == 0.0:
+            return 'tassa'
+        return voce
+
+    @staticmethod
+    def _classify_cls_from_pol_name(pol_name: str) -> Optional[str]:
+        """Estrae classificazione fiscale veicolo dal `name` della POL.
+
+        Le POL pre-pianificate da Acquisti sull'OdA-ledger annuale (es. P03021
+        Leasys) hanno name semantico tipo:
+          'P03021: Riaddebito Tassa Automobilistica Regionale GENNAIO 2026 USO PROMISCUO'
+          'P03021: Riaddebito Tassa Automobilistica Regionale Furgoni febbraio 2026'
+          'P03021: CANONE LOCAZIONE HC444CS 3008 25/02/26-31/03/26'
+
+        Le varianti lessicali (raccolte da name reali registrati a mano dalla
+        contabilita') sono:
+          POOL (100%):           AUTOMEZZI, FURGONI, automezzi, POOL
+          uso_promiscuo (70%):   USO PROMISCUO, AUTOVETTURE, autovetture, uso promiscuo
+          super_lusso:           SUPER LUSSO, SUPERLUSSO
+
+        Usato in `create_bozza_automezzi` come **fallback** quando la cls
+        derivata da targa risulta 'default_unknown' (es. riga bollo aggregato
+        senza targa nella descrizione XML).
+
+        Ritorna None se nessuna etichetta riconoscibile -> il caller deve
+        mantenere il fallback esistente (uso_promiscuo conservativo).
+        """
+        if not pol_name:
+            return None
+        name_u = pol_name.upper()
+        if 'SUPER LUSSO' in name_u or 'SUPERLUSSO' in name_u:
+            return 'super_lusso'
+        # POOL: AUTOMEZZI/FURGONI. Attenzione: 'AUTOMEZZI' contiene 'AUTO'
+        # ma NON va confuso con 'AUTOVETTURE'. Match esatto su token.
+        if any(tok in name_u for tok in (
+                ' AUTOMEZZI', 'AUTOMEZZI ', 'AUTOMEZZI\n', '\nAUTOMEZZI',
+                'FURGONI', ' POOL', 'POOL ', 'POOL\n', '\nPOOL')):
+            return 'POOL'
+        # uso_promiscuo: USO PROMISCUO o AUTOVETTURE (femminile plurale, no
+        # confusione con AUTOMEZZI)
+        if 'USO PROMISCUO' in name_u or 'AUTOVETTURE' in name_u or 'AUTOVETTURA' in name_u:
+            return 'uso_promiscuo'
+        return None
+
+    @staticmethod
+    def _pol_name_matches_voce(pol: Dict, voce: str) -> bool:
+        """Filtra POL adatte a una voce in base al `name` della POL.
+
+        Le POL pre-pianificate da Acquisti su P03021 Leasys hanno name semantico
+        che dichiara la voce (tassa/locazione/servizi). Quando la fattura XML
+        e' "muta" sulla descrizione (solo targa+modello), questo filtro evita
+        che una riga "bollo" (voce='tassa' dedotta da aliquota 0%) finisca su
+        una POL "CANONE LOCAZIONE" semplicemente perche' era prima nell'ordine
+        FIFO.
+
+        Logica:
+          - POL name contiene keyword tassa  -> serve solo voce='tassa'
+          - POL name contiene 'CANONE LOCAZIONE' -> serve solo voce='locazione'
+          - POL name contiene 'CANONE SERVIZI'/'CANONESERVIZIO' o keyword
+            servizi/multe/penali -> serve solo voce='servizi'
+          - POL name generico (no pattern) -> accetta qualsiasi voce (jolly).
+
+        Funziona in AND col filtro product (`_pol_product_matches_voce`).
+        """
+        name_u = (pol.get('name') or '').upper()
+        if not name_u:
+            return True
+        is_tassa_pol = any(t in name_u for t in (
+            'TASSA AUTOMOBILISTICA', 'RIADDEBITO TASS', 'TASSA DI POSSESSO',
+            'TASSA DI PROPRIETA', 'SUPERBOLLO',
+            # 'BOLLO' da solo e' troppo generico (matcha 'BOLLO IN FATTURA'
+            # che e' bollo, ok; ma non matcha falsi positivi nel dominio)
+            'BOLLO',
+        ))
+        is_locazione_pol = (
+            'CANONE LOCAZIONE' in name_u
+            or 'CANONE LOC.' in name_u
+            or 'CANONE NOLEGGIO' in name_u
+            # 'LOCAZIONE' da sola, ma NON se preceduta da 'CANONE SERVIZIO LOCAZIONE'
+            or (' LOCAZIONE ' in name_u and 'SERVIZIO' not in name_u)
+        )
+        is_servizi_pol = any(t in name_u for t in (
+            'CANONE SERVIZIO', 'CANONE SERVIZI', 'CANONESERVIZIO',
+            'GESTIONE E SERVIZI',
+            'NOTIFICA VERBALI', 'NOTIFICA MULTA', 'NOTIFICA INFRAZIONE',
+            'GESTIONE MULTA', 'GESTIONE INFRAZIONE',
+            'PENALE', 'ADDEBITO SPESE AMM', 'SPESE AMMINISTRATIVE',
+            'VERBALE',
+        ))
+        if voce == 'tassa':
+            return is_tassa_pol or not (is_locazione_pol or is_servizi_pol)
+        if voce == 'locazione':
+            return is_locazione_pol or not (is_tassa_pol or is_servizi_pol)
+        if voce == 'servizi':
+            return is_servizi_pol or not (is_tassa_pol or is_locazione_pol)
+        # spese_incasso e altre voci: gestione dal product matching
+        return True
+
+    @staticmethod
+    def _pol_name_matches_periodo(pol: Dict, periodo: str) -> bool:
+        """Filtra POL il cui name contiene il periodo italiano richiesto.
+
+        `periodo` formato 'Maggio 2026' (output di _format_periodo_italiano).
+        Match case-insensitive su mese+anno per evitare di consumare la POL
+        del mese sbagliato (caso Athlon HD446BE: Luglio libera non deve essere
+        usata per riga Maggio).
+
+        Se `periodo` non passato (riga senza Mese A/Mese da), ritorna True
+        (jolly). Se POL ha name SENZA alcun mese italiano, ritorna True (POL
+        generica, ok per qualsiasi periodo).
+        """
+        if not periodo:
+            return True
+        name_u = (pol.get('name') or '').upper()
+        if not name_u:
+            return True
+        # Verifica se la POL cita un mese italiano qualsiasi
+        any_month_pattern = r'\b(' + '|'.join(
+            OdooWriter._MESI_ITALIANI.values()).upper() + r')\b'
+        has_any_month = re.search(any_month_pattern, name_u)
+        if not has_any_month:
+            return True  # POL generica
+        return periodo.upper() in name_u
+
+    @staticmethod
+    def _pol_name_matches_targa(pol: Dict, targa: str) -> bool:
+        """Filtra POL che citano una targa specifica nel `name`.
+
+        Simmetrico a `_pol_name_matches_voce`: evita che una riga di una targa
+        finisca su una POL pre-pianificata per un'altra targa (caso Athlon
+        P04797 con sole POL HD446BE che non devono essere riscritte da una
+        riga GW950EK).
+
+        Se `targa` non passata, ritorna True (jolly). Se POL ha name senza
+        nessuna targa (es. "TEST EUR1"), ritorna True (POL generica).
+        """
+        if not targa:
+            return True
+        name_u = (pol.get('name') or '').upper()
+        if not name_u:
+            return True
+        # Controlla se la POL cita qualche targa
+        any_targa = re.search(r'\b[A-Z]{2}\d{3}[A-Z]{2}\b', name_u)
+        if not any_targa:
+            return True  # POL generica, accetta
+        return targa.upper() in name_u
+
+    @staticmethod
+    def _extract_modello_veicolo_from_riga(riga) -> str:
+        """Estrae il modello veicolo da AltriDatiGestionali (Athlon).
+
+        Athlon XML: <TipoDato>Veicolo</TipoDato><RiferimentoTesto>BMW X4...</RiferimentoTesto>.
+        Fallback: prima parola lunga della descrizione XML.
+        """
+        adg = getattr(riga, 'altri_dati_gestionali', None) or {}
+        veicolo = (adg.get('VEICOLO') or adg.get('Veicolo')
+                    or adg.get('MODELLO') or '').strip()
+        if veicolo:
+            return veicolo
+        return ''
+
+    _MESI_ITALIANI = {
+        1: 'Gennaio', 2: 'Febbraio', 3: 'Marzo', 4: 'Aprile',
+        5: 'Maggio', 6: 'Giugno', 7: 'Luglio', 8: 'Agosto',
+        9: 'Settembre', 10: 'Ottobre', 11: 'Novembre', 12: 'Dicembre',
+    }
+
+    @staticmethod
+    def _format_periodo_italiano(data_str: str) -> str:
+        """Converte '2026-05-01' o '2026-05-31' in 'Maggio 2026'."""
+        if not data_str:
+            return ''
+        try:
+            from datetime import datetime
+            d = datetime.strptime(data_str[:10], '%Y-%m-%d')
+            return f"{OdooWriter._MESI_ITALIANI[d.month]} {d.year}"
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _extract_periodo_from_riga(riga) -> str:
+        """Periodo di competenza Athlon-style 'Maggio 2026'.
+
+        Prende 'Mese a' da AltriDatiGestionali, fallback su 'Mese da'.
+        """
+        adg = getattr(riga, 'altri_dati_gestionali', None) or {}
+        mese_a = adg.get('MESE A') or adg.get('Mese a') or ''
+        mese_da = adg.get('MESE DA') or adg.get('Mese da') or ''
+        ref = mese_a or mese_da
+        return OdooWriter._format_periodo_italiano(ref)
+
+    @staticmethod
+    def _build_athlon_pol_name(modello: str, targa: str, periodo: str) -> str:
+        """Costruisce name POL Athlon nel formato storico:
+            'Noleggio Mercedes-Benz GLE Coupé\nTarga: HD446BE\nPeriodo: Maggio 2026'
+        """
+        if not modello:
+            modello = 'veicolo'
+        parts = [f"Noleggio {modello}"]
+        if targa:
+            parts.append(f"Targa: {targa}")
+        if periodo:
+            parts.append(f"Periodo: {periodo}")
+        return "\n".join(parts)
 
     @staticmethod
     def _extract_targa_automezzi(riga, raw_xml_line: str = '') -> str:
@@ -2690,6 +2930,210 @@ class OdooWriter:
                           f"(con {candidates[0][1]} POL libere matching)")
             return candidates[0][0]
         return None
+
+    _VIRTUAL_POL_COUNTER = [-1]  # contatore placeholder id (negativi)
+
+    def _build_virtual_pol_athlon(self, ri: Dict, mapping_entry: Dict,
+                                     po_id: int, existing_libere: List[Dict],
+                                     invoice_date: str) -> Optional[Dict]:
+        """Costruisce una POL "virtuale" per Athlon quando manca la POL del periodo.
+
+        Eredita product_id / product_uom / account_analytic dalle POL gemelle
+        della stessa targa già presenti sull'OdA (sia libere sia usate).
+        Il `name` segue il pattern storico Athlon:
+            "Noleggio {Veicolo XML}\nTarga: {targa}\nPeriodo: {Mese A 'Italiano' YYYY}"
+
+        Ritorna un dict POL-like (campi minimi richiesti dal loop chiamante)
+        con placeholder_id negativo. La scrittura reale (create POL su Odoo)
+        avviene poi in batch.
+        """
+        riga = ri['riga']
+        targa = ri['targa'] or ''
+        periodo = self._extract_periodo_from_riga(riga) or self._format_periodo_italiano(invoice_date)
+
+        # Cerca POL gemelle (stessa targa, già su quest'OdA) per ereditare
+        # product_id, product_uom, analytic_account E per copiare il modello
+        # formattato (es. "Mercedes-Benz GLE Coupé" invece di XML grezzo
+        # "MERCEDESBENZ GLE COUPE GLE 350 de 4M EQ AMG Line Prem Plus").
+        sibling = None
+        modello_sibling = ''
+        if targa:
+            siblings = self.client._call('purchase.order.line', 'search_read',
+                [('order_id', '=', po_id),
+                 ('name', 'ilike', targa)],
+                fields=['id', 'name', 'product_id', 'product_uom',
+                         'account_analytic_id', 'price_unit', 'taxes_id'],
+                limit=1)
+            if siblings:
+                sibling = siblings[0]
+                s_name = sibling.get('name') or ''
+                if s_name.startswith('Noleggio '):
+                    first_line = s_name.split('\n')[0]
+                    modello_sibling = first_line.replace('Noleggio ', '', 1).strip()
+        if not sibling:
+            # Fallback: prima POL libera dell'OdA (per product/uom)
+            if existing_libere:
+                sibling = existing_libere[0]
+        if not sibling:
+            return None
+
+        # Modello: preferisco sibling (formato pulito), fallback su XML
+        modello = modello_sibling or self._extract_modello_veicolo_from_riga(riga)
+        new_name = self._build_athlon_pol_name(modello, targa, periodo)
+
+        price = float(riga.prezzo_totale or riga.prezzo_unitario or 0)
+        OdooWriter._VIRTUAL_POL_COUNTER[0] -= 1
+        placeholder_id = OdooWriter._VIRTUAL_POL_COUNTER[0]
+        return {
+            'id': placeholder_id,  # negativo = placeholder, sostituito alla scrittura
+            'name': new_name,
+            'price_unit': price,
+            'product_id': sibling.get('product_id'),
+            'product_uom': sibling.get('product_uom'),
+            'account_analytic_id': sibling.get('account_analytic_id'),
+            'taxes_id': [ri['tax_id']],
+            'qty_invoiced': 0.0,
+            'qty_received': 0.0,
+            'product_qty': 1.0,
+            'date_planned': invoice_date,
+            '_is_virtual': True,
+        }
+
+    def _compute_athlon_gap_fillers(self, pol_extra_to_create: List[Dict],
+                                       oda_state: Dict, oda_to_righe: Dict) -> List[Dict]:
+        """Calcola POL libere da creare per riempire i buchi tra le POL
+        virtuali appena consumate e le POL pre-pianificate successive sulla
+        stessa targa+OdA.
+
+        Esempio Athlon HD446BE su P04797:
+          POL esistenti per targa: Aprile(usata), Luglio(libera), Agosto,
+          Settembre, Ottobre, Novembre, Dicembre.
+          POL virtuale appena creata per la fattura: Maggio.
+          Gap da riempire: Giugno (1 POL libera).
+        """
+        gap_fillers = []
+        # Mesi italiani -> index (invertito per parsing)
+        month_to_idx = {v.upper(): k for k, v in OdooWriter._MESI_ITALIANI.items()}
+        month_re = re.compile(r'\b(' + '|'.join(OdooWriter._MESI_ITALIANI.values()).upper()
+                                + r')\s+(\d{4})\b')
+
+        for pv in pol_extra_to_create:
+            targa = pv['targa']
+            po_id = pv['po_id']
+            if not targa:
+                continue
+            # Parse mese della POL virtuale dal name
+            m = month_re.search(pv['name'].upper())
+            if not m:
+                continue
+            virtual_month = month_to_idx[m.group(1)]
+            virtual_year = int(m.group(2))
+            virtual_ym = (virtual_year, virtual_month)
+            # Cerca tutte le POL della targa sull'OdA
+            siblings = self.client._call('purchase.order.line', 'search_read',
+                [('order_id', '=', po_id),
+                 ('name', 'ilike', targa)],
+                fields=['id', 'name', 'price_unit', 'product_id',
+                         'product_uom', 'taxes_id', 'date_planned'])
+            # Trova il prossimo mese pianificato dopo virtual_ym
+            future_months = []
+            sibling_template = None
+            for s in siblings:
+                m2 = month_re.search((s.get('name') or '').upper())
+                if not m2:
+                    continue
+                sy = (int(m2.group(2)), month_to_idx[m2.group(1)])
+                if sy > virtual_ym:
+                    future_months.append(sy)
+                if sibling_template is None:
+                    sibling_template = s
+            if not future_months:
+                continue
+            future_months.sort()
+            next_ym = future_months[0]
+            # Genero mesi nel gap (esclusivi virtual_ym, esclusivi next_ym)
+            cur = virtual_ym
+            while True:
+                # Avanza di 1 mese
+                y, mo = cur
+                mo += 1
+                if mo > 12:
+                    mo = 1
+                    y += 1
+                cur = (y, mo)
+                if cur >= next_ym:
+                    break
+                # Crea POL gap-filler
+                mese_str = OdooWriter._MESI_ITALIANI[mo]
+                modello = ''
+                # Estrai modello dal name della sibling template
+                if sibling_template:
+                    s_name = sibling_template.get('name') or ''
+                    if s_name.startswith('Noleggio '):
+                        first_line = s_name.split('\n')[0]
+                        modello = first_line.replace('Noleggio ', '', 1).strip()
+                gap_name = self._build_athlon_pol_name(
+                    modello or 'veicolo', targa, f"{mese_str} {y}")
+                # Tax: riusa quella della POL virtuale (cls corrente dal PARCO)
+                tax_id_gap = pv['tax_id']
+                # Product: dal sibling
+                prod = (sibling_template.get('product_id')
+                         if sibling_template else None)
+                uom = (sibling_template.get('product_uom')
+                        if sibling_template else None)
+                gap_fillers.append({
+                    'po_id': po_id,
+                    'oda_name': pv['oda_name'],
+                    'name': gap_name,
+                    'price_unit': sibling_template.get('price_unit') or pv['price_unit'],
+                    'tax_id': tax_id_gap,
+                    'product_id': prod[0] if isinstance(prod, list) else prod,
+                    'product_uom': uom[0] if isinstance(uom, list) else uom,
+                    'targa': targa,
+                    'date_planned': f"{y}-{mo:02d}-01",
+                })
+        return gap_fillers
+
+    def _discover_oda_with_targa_history(self, partner_id: int, targa: str,
+                                            candidates: List[Optional[str]],
+                                            company_id: int = 1) -> Optional[str]:
+        """Variante di _auto_discover_oda_by_targa che accetta anche POL già
+        USATE (qty_invoiced>0) per la targa.
+
+        Usato quando una targa ha tutte le POL pre-pianificate già consumate,
+        ma serve comunque scegliere l'OdA giusto per creare POL extra
+        (auto_create_missing_pol). Restringe la ricerca a `candidates` se
+        fornito.
+
+        Restituisce il `name` dell'OdA o None.
+        """
+        if not partner_id or not targa:
+            return None
+        cand_filter = [c for c in candidates if c]
+        if cand_filter:
+            pos = self.client._call('purchase.order', 'search_read',
+                [('partner_id', '=', partner_id),
+                 ('company_id', '=', company_id),
+                 ('state', '=', 'purchase'),
+                 ('name', 'in', cand_filter)],
+                fields=['id', 'name'], limit=20)
+        else:
+            pos = self.client._call('purchase.order', 'search_read',
+                [('partner_id', '=', partner_id),
+                 ('company_id', '=', company_id),
+                 ('state', '=', 'purchase')],
+                fields=['id', 'name'], limit=50)
+        ranked = []
+        for po in pos:
+            cnt = self.client._call('purchase.order.line', 'search_count',
+                [('order_id', '=', po['id']),
+                 ('name', 'ilike', targa)])
+            if cnt > 0:
+                ranked.append((po['name'], cnt))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: -x[1])
+        return ranked[0][0]
 
     def _resolve_classificazione_veicolo(self, targa: str,
                                            numero_contratto_xml: str,
@@ -2809,7 +3253,9 @@ class OdooWriter:
         riga_info_list = []
         for riga in righe:
             desc = riga.descrizione or ''
-            voce = self._classify_voce_automezzi(desc)
+            # Classifier voce con fallback su aliquota IVA per descrizioni XML
+            # mute (es. Leasys bollo righe 'TARGA MODELLO' senza keyword).
+            voce = self._classify_voce_automezzi_full(riga)
             targa = self._extract_targa_automezzi(riga)
             # Numero contratto: per UnipolRental da regex "Contr. n.NNN"
             # nella desc; per altri si tenta dal contratto_riferimenti XML
@@ -2851,6 +3297,29 @@ class OdooWriter:
                                        f"{oda_name} (non in mappatura statica)")
                     if not oda_name:
                         oda_name = mapping_entry.get('oda_default')
+            elif mapping_entry.get('multi_oda_per_targa') and targa:
+                # Pattern Athlon: 1 OdA per veicolo (P03798=GW950EK,
+                # P04797=HD446BE). Per ogni riga, cerca l'OdA con POL
+                # (libere o usate) che cita la targa fra oda_fisso + oda_storico
+                # + auto-discovery globale del fornitore.
+                oda_name = self._auto_discover_oda_by_targa(
+                    mapping_entry.get('partner_id'),
+                    targa,
+                    company_id=mapping_entry.get('company_id', 1))
+                if not oda_name:
+                    # Cerca anche in OdA aperti con POL già usate per la targa
+                    # (caso: tutte le POL del veicolo già consumate, ma OdA
+                    # ancora pertinente per creare POL extra).
+                    oda_name = self._discover_oda_with_targa_history(
+                        mapping_entry.get('partner_id'),
+                        targa,
+                        candidates=[mapping_entry.get('oda_fisso'),
+                                    mapping_entry.get('oda_storico')],
+                        company_id=mapping_entry.get('company_id', 1))
+                if not oda_name:
+                    oda_name = mapping_entry.get('oda_fisso')
+                if oda_name:
+                    logger.info(f"Multi-OdA Athlon: targa={targa} -> {oda_name}")
             else:
                 oda_name = mapping_entry.get('oda_fisso')
 
@@ -2944,32 +3413,125 @@ class OdooWriter:
         # Tracking per OdA: set di POL già consumate in questa fattura
         oda_pol_used = {oda: set() for oda in oda_to_righe.keys()}
 
+        # POL extra da creare al volo (per fornitori con auto_create_missing_pol)
+        # come Athlon, quando per (targa, periodo) non esiste POL pre-pianificata.
+        pol_extra_to_create = []  # list di dict: {'po_id', 'oda_name', 'name', 'price_unit', 'tax_id', 'product_id', 'targa', 'is_gap_filler'}
+
         for ri in riga_info_list:
             oda_name = ri['oda_name']
             st = oda_state[oda_name]
             voce = ri['voce']
-            # Cerca prima POL libera col product matching la voce
+            targa = ri['targa'] or ''
+            periodo = self._extract_periodo_from_riga(ri['riga'])
+            # Match per periodo attivo solo se mapping ha auto_create_missing_pol:
+            # senza creazione automatica, useremmo POL del mese sbagliato come
+            # fallback. Con creazione automatica, preferiamo POL nuova al periodo
+            # giusto.
+            match_periodo = bool(mapping_entry.get('auto_create_missing_pol')) and periodo
+            # Cerca prima POL libera matching: targa + periodo + product + name semantico.
+            # Importante per Athlon multi-veicolo (P04797 ha solo POL HD446BE,
+            # P03798 solo GW950EK) e per fatture che coprono mesi diversi dalle
+            # POL pre-pianificate.
             pol = None
             for cand in st['libere']:
                 if cand['id'] in oda_pol_used[oda_name]:
                     continue
-                if self._pol_product_matches_voce(cand, voce):
+                if (self._pol_name_matches_targa(cand, targa)
+                        and (not match_periodo or self._pol_name_matches_periodo(cand, periodo))
+                        and self._pol_product_matches_voce(cand, voce)
+                        and self._pol_name_matches_voce(cand, voce)):
                     pol = cand
                     break
-            # Fallback: se nessuna POL match per voce, prendi la prima libera
-            # disponibile (caso edge: OdA con product_id uniformi)
+            # Fallback livello 1: rilasso il filtro voce/name (POL generiche
+            # tipo 'TEST EUR1'), ma mantengo filtro targa + periodo.
             if pol is None:
+                for cand in st['libere']:
+                    if cand['id'] in oda_pol_used[oda_name]:
+                        continue
+                    if (self._pol_name_matches_targa(cand, targa)
+                            and (not match_periodo or self._pol_name_matches_periodo(cand, periodo))
+                            and self._pol_product_matches_voce(cand, voce)):
+                        pol = cand
+                        break
+            # Fallback livello 2: prima libera con targa matching (anche
+            # product non matching, fornitori con product unico). Filtro
+            # periodo ancora attivo se richiesto.
+            if pol is None:
+                for cand in st['libere']:
+                    if cand['id'] in oda_pol_used[oda_name]:
+                        continue
+                    if (self._pol_name_matches_targa(cand, targa)
+                            and (not match_periodo or self._pol_name_matches_periodo(cand, periodo))):
+                        pol = cand
+                        break
+            # Fallback livello 3: prima libera in assoluto (solo se NON c'è
+            # auto_create — altrimenti meglio creare POL nuova che riusare
+            # POL di altra targa).
+            if pol is None and not mapping_entry.get('auto_create_missing_pol'):
                 for cand in st['libere']:
                     if cand['id'] not in oda_pol_used[oda_name]:
                         pol = cand
                         break
+            # Auto-create: se nessuna POL libera per la targa e mapping
+            # consente la creazione, ne creiamo una al volo (pattern Athlon
+            # quando manca la POL del periodo richiesto).
+            if pol is None and mapping_entry.get('auto_create_missing_pol'):
+                pol = self._build_virtual_pol_athlon(
+                    ri=ri,
+                    mapping_entry=mapping_entry,
+                    po_id=st['po_id'],
+                    existing_libere=st['libere'],
+                    invoice_date=invoice_date)
+                if pol:
+                    # Aggiungo alla coda di POL da creare (uso un id negativo
+                    # come placeholder; verra' assegnato un id reale alla
+                    # scrittura).
+                    pol_extra_to_create.append({
+                        'placeholder_id': pol['id'],
+                        'po_id': st['po_id'],
+                        'oda_name': oda_name,
+                        'name': pol['name'],
+                        'price_unit': pol['price_unit'],
+                        'tax_id': ri['tax_id'],
+                        'product_id': (pol['product_id'][0]
+                                        if isinstance(pol.get('product_id'), list)
+                                        else pol.get('product_id')),
+                        'product_uom': (pol['product_uom'][0]
+                                         if isinstance(pol.get('product_uom'), list)
+                                         else pol.get('product_uom')),
+                        'targa': targa,
+                        'is_gap_filler': False,
+                    })
+                    # La aggiungo alle libere dell'OdA per il prossimo ciclo
+                    st['libere'].append(pol)
             if pol is None:
                 return WriteResult(success=False, action='create_draft_automezzi',
                                    error_message=(f"POL libere insufficienti su {oda_name} "
-                                                  f"per voce={voce} (fattura ha "
+                                                  f"per voce={voce} targa={targa or '?'} (fattura ha "
                                                   f"{len(oda_to_righe[oda_name])} righe)"),
                                    dry_run=self.dry_run)
             oda_pol_used[oda_name].add(pol['id'])
+
+            # Override cls dal name POL se PARCO_BY_TARGA/CONTRATTO non
+            # l'hanno determinata. Caso d'uso: bollo Leasys aggregato (no
+            # targa nella desc XML) -> cls cade in 'default_unknown'/
+            # 'default_no_mapping'. Il name della POL pre-pianificata da
+            # Acquisti dichiara la classificazione ('USO PROMISCUO' vs
+            # 'AUTOMEZZI/FURGONI').
+            if ri['cls_source'] in ('default_unknown', 'default_no_mapping'):
+                cls_from_pol = self._classify_cls_from_pol_name(pol.get('name'))
+                if cls_from_pol and cls_from_pol != ri['cls']:
+                    ri['cls'] = cls_from_pol
+                    ri['cls_source'] = 'pol_name'
+                    # Ricalcola conto + tax con la cls aggiornata
+                    new_conto = (CONTO_AUTOMEZZI.get((voce, cls_from_pol))
+                                 or CONTO_AUTOMEZZI.get((voce, 'uso_promiscuo')))
+                    if new_conto:
+                        ri['conto'] = new_conto
+                    new_tax = (TAX_AUTOMEZZI.get(vat, {}).get((voce, cls_from_pol))
+                               or TAX_AUTOMEZZI.get(vat, {}).get((voce, '*')))
+                    if new_tax:
+                        ri['tax_id'] = new_tax
 
             riga = ri['riga']
             # Importo riga
@@ -2978,9 +3540,35 @@ class OdooWriter:
             if is_nota_credito:
                 price = -abs(price)
 
-            # name allineato al pattern fornitore (preservo desc XML originale)
+            # Strategia descrizione:
+            #  - 'leasys' (e qualunque mapping con keep_pol_name=True):
+            #      preserva il name della POL pre-pianificata da Acquisti,
+            #      che e' gia' semantico (es. 'P03021: Riaddebito Tassa
+            #      Automobilistica Regionale GENNAIO 2026 USO PROMISCUO').
+            #      Fallback su desc XML se POL ha name generico ('TEST EUR1').
+            #  - altri (default): usa la desc XML (Tecnoalt/Athlon/UnipolRental/
+            #      ALD/Arval hanno desc XML informativa con targa+modello+
+            #      periodo o keyword tassa esplicita).
+            desc_strategy = (mapping_entry.get('description_strategy') or '').lower()
+            keep_pol_name = (desc_strategy == 'leasys'
+                              or mapping_entry.get('keep_pol_name') is True)
             desc_orig = (riga.descrizione or '').strip()
-            new_name = desc_orig if desc_orig else f"{ri['voce']} automezzi"
+            pol_name = (pol.get('name') or '').strip()
+            pol_name_is_semantic = (
+                self._classify_cls_from_pol_name(pol_name) is not None
+                or self._pol_name_matches_voce(pol, ri['voce']) and pol_name
+                    and any(t in pol_name.upper() for t in (
+                        'TASSA AUTOMOBILISTICA', 'RIADDEBITO TASS',
+                        'CANONE LOCAZIONE', 'CANONE SERVIZIO',
+                        'CANONE SERVIZI', 'CANONESERVIZIO', 'CANONE NOLEGGIO',
+                        'NOLEGGIO'))
+            )
+            if keep_pol_name and pol_name_is_semantic:
+                new_name = pol_name
+            elif desc_orig:
+                new_name = desc_orig
+            else:
+                new_name = f"{ri['voce']} automezzi"
             # Aggiungo periodo se presente
             data_inizio = getattr(riga, 'data_inizio_periodo', None) if hasattr(riga, 'data_inizio_periodo') else None
             data_fine = getattr(riga, 'data_fine_periodo', None) if hasattr(riga, 'data_fine_periodo') else None
@@ -3053,6 +3641,15 @@ class OdooWriter:
             'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
         }
 
+        # Gap-filling: calcola POL libere future da creare per riempire i
+        # buchi tra le POL virtuali appena consumate e le POL pre-pianificate
+        # successive. Solo per fornitori con fill_pol_gap_until_next=True
+        # (Athlon). Usa il pattern name "...Mese YYYY" italiano.
+        pol_gap_fillers = []
+        if mapping_entry.get('fill_pol_gap_until_next') and pol_extra_to_create:
+            pol_gap_fillers = self._compute_athlon_gap_fillers(
+                pol_extra_to_create, oda_state, oda_to_righe)
+
         if self.dry_run:
             tot = sum(ml['price_unit'] for ml in move_lines_vals)
             consumed_str = '; '.join(
@@ -3065,6 +3662,20 @@ class OdooWriter:
                 f"OdA={all_odas} righe={len(move_lines_vals)} "
                 f"consume-POL=[{consumed_str}] "
                 f"tot_imponibile={tot:.2f}")
+            if pol_extra_to_create:
+                logger.info(
+                    f"[DRY_RUN] POL virtuali da creare (consumate dalla fattura): "
+                    + '; '.join(f"OdA={p['oda_name']} targa={p['targa']} "
+                                f"price={p['price_unit']:.2f} tax{p['tax_id']} "
+                                f"name={p['name']!r}"
+                                for p in pol_extra_to_create))
+            if pol_gap_fillers:
+                logger.info(
+                    f"[DRY_RUN] POL gap-filler libere da creare ({len(pol_gap_fillers)}): "
+                    + '; '.join(f"OdA={p['oda_name']} targa={p['targa']} "
+                                f"price={p['price_unit']:.2f} tax{p['tax_id']} "
+                                f"name={p['name']!r}"
+                                for p in pol_gap_fillers))
             primary = consumed_pol_info[0]
             extras = [
                 {'po_line_id': p['po_line_id'],
@@ -3085,6 +3696,60 @@ class OdooWriter:
 
         # === SCRITTURA REALE ===
         try:
+            # Step 0: crea POL virtuali (mapping placeholder_id<0 -> id reale Odoo)
+            virtual_id_map = {}
+            for pv in pol_extra_to_create:
+                pol_vals = {
+                    'order_id': pv['po_id'],
+                    'name': pv['name'],
+                    'price_unit': pv['price_unit'],
+                    'product_qty': 1,
+                    'taxes_id': [(6, 0, [pv['tax_id']])],
+                    'date_planned': invoice_date,
+                }
+                if pv.get('product_id'):
+                    pol_vals['product_id'] = pv['product_id']
+                if pv.get('product_uom'):
+                    pol_vals['product_uom'] = pv['product_uom']
+                new_pol_id = self.client._call('purchase.order.line', 'create', pol_vals)
+                if isinstance(new_pol_id, list):
+                    new_pol_id = new_pol_id[0]
+                virtual_id_map[pv['placeholder_id']] = new_pol_id
+                logger.info(f"Created virtual POL {new_pol_id} on {pv['oda_name']} "
+                           f"targa={pv['targa']} price={pv['price_unit']:.2f}: "
+                           f"name={pv['name']!r}")
+            # Sostituisco placeholder negativi con id reali in consumed_pol_info
+            # e in move_lines_vals
+            for p in consumed_pol_info:
+                if p['po_line_id'] in virtual_id_map:
+                    p['po_line_id'] = virtual_id_map[p['po_line_id']]
+            for ml in move_lines_vals:
+                if ml.get('purchase_line_id') in virtual_id_map:
+                    ml['purchase_line_id'] = virtual_id_map[ml['purchase_line_id']]
+            # Aggiorno anche move_vals (invoice_line_ids contiene tupla (0,0,ml))
+            move_vals['invoice_line_ids'] = [(0, 0, ml) for ml in move_lines_vals]
+
+            # Step 0b: crea POL gap-filler libere (qty_received=0)
+            for pgf in pol_gap_fillers:
+                gap_vals = {
+                    'order_id': pgf['po_id'],
+                    'name': pgf['name'],
+                    'price_unit': pgf['price_unit'],
+                    'product_qty': 1,
+                    'taxes_id': [(6, 0, [pgf['tax_id']])],
+                    'date_planned': pgf.get('date_planned') or invoice_date,
+                }
+                if pgf.get('product_id'):
+                    gap_vals['product_id'] = pgf['product_id']
+                if pgf.get('product_uom'):
+                    gap_vals['product_uom'] = pgf['product_uom']
+                new_gap_id = self.client._call('purchase.order.line', 'create', gap_vals)
+                if isinstance(new_gap_id, list):
+                    new_gap_id = new_gap_id[0]
+                pgf['created_pol_id'] = new_gap_id
+                logger.info(f"Created gap-filler POL {new_gap_id} on {pgf['oda_name']} "
+                           f"targa={pgf['targa']}: name={pgf['name']!r}")
+
             for p in consumed_pol_info:
                 self.client._call('purchase.order.line', 'write',
                     [p['po_line_id']], {
