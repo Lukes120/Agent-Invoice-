@@ -3,14 +3,14 @@ Mappa Parco Auto -> classificazione fiscale veicolo (Ecotel).
 
 AUTO-GENERATO da scripts/generate_parco_auto_mapping.py
 Sorgente: Parco Auto.xlsx (foglio "Parco Auto")
-Generato: 2026-05-12 16:55:07
-Targhe distinte: 69
+Generato: 2026-05-13 18:58:01
+Targhe distinte: 71
 Contratti distinti: 64
 Colonna STATO presente: True (altrimenti dedotto da DATA FINE)
 Colonna CLASSIFICAZIONE FISCALE presente: True (altrimenti dedotta da col D)
-Distribuzione classificazione: {'uso_promiscuo': 30, 'super_lusso': 2, 'POOL': 37}
-Distribuzione stato: {'ATTIVO': 66, 'DISMESSO': 3}
-Distribuzione fornitore: {'LEASYS': 49, 'ATHLON': 3, 'TECNOALT': 6, 'ALD AUTOMATIVE': 1, 'LEASEPLAN': 1, 'UNIPOL RENTAL': 5, 'ARVAL': 1, 'SANTANDER': 1, 'ECOTEL': 2}
+Distribuzione classificazione: {'uso_promiscuo': 30, 'super_lusso': 2, 'POOL': 39}
+Distribuzione stato: {'ATTIVO': 68, 'DISMESSO': 3}
+Distribuzione fornitore: {'LEASYS': 51, 'ATHLON': 3, 'TECNOALT': 6, 'ALD AUTOMATIVE': 1, 'LEASEPLAN': 1, 'UNIPOL RENTAL': 5, 'ARVAL': 1, 'SANTANDER': 1, 'ECOTEL': 2}
 Skipped: 0 | Duplicati targa: 9 | Duplicati contratto: 8
 
 NON modificare a mano: rigenerare con
@@ -553,6 +553,17 @@ PARCO_BY_TARGA: Dict[str, dict] = {
         "data_fine": "2025-01-28",
         "canone": 441.27,
     },
+    "GW934RP": {
+        "targa": "GW934RP",
+        "modello": 'PEUGEOT BOXER',
+        "fornitore": 'LEASYS',
+        "assegnatario": 'POOL',
+        "contratto": "",
+        "classificazione": "POOL",
+        "stato": "ATTIVO",
+        "data_inizio": "",
+        "data_fine": "",
+    },
     "GW938RP": {
         "targa": "GW938RP",
         "modello": 'PEUGEOT BOXER 2.2 BLUEHDI 140 S&S 333 L2H2',
@@ -755,6 +766,17 @@ PARCO_BY_TARGA: Dict[str, dict] = {
         "data_inizio": "2025-11-17",
         "data_fine": "2028-11-17",
         "canone": 468.47,
+    },
+    "HA570JN": {
+        "targa": "HA570JN",
+        "modello": 'FIAT DUCATO 35Q LH2 140CV 2.2 Multijet 3 E6E',
+        "fornitore": 'LEASYS',
+        "assegnatario": 'POOL',
+        "contratto": "",
+        "classificazione": "POOL",
+        "stato": "ATTIVO",
+        "data_inizio": "",
+        "data_fine": "",
     },
     "HA737WH": {
         "targa": "HA737WH",

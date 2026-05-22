@@ -753,9 +753,13 @@ def api_odoo_create_draft(analysis_id):
             return {'success': False,
                     'error': f"Auto-write disabilitato per {mapping['nome']}"}, 400
 
-        # Crea bozza: usa multilinea se multi_contratto, altrimenti metodo standard
+        # Crea bozza: usa multilinea se multi_contratto, line_groups o
+        # line_groups_by_month (es. WE4SERVICES P03696); altrimenti standard.
         writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
-        if mapping_raw.get('multi_contratto'):
+        needs_multilinea = (mapping_raw.get('multi_contratto')
+                            or mapping_raw.get('line_groups')
+                            or mapping_raw.get('line_groups_by_month'))
+        if needs_multilinea:
             result = writer.create_bozza_multilinea(analysis, mapping)
         else:
             result = writer.create_bozza_fornitore_fisso(analysis, mapping)
@@ -807,7 +811,8 @@ def api_odoo_rollback(analysis_id):
             WHERE analysis_id=? AND action IN
                 ('create_draft','create_draft_from_oda','create_draft_libera',
                  'create_draft_autostrade','create_draft_telepass_canoni',
-                 'create_draft_automezzi')
+                 'create_draft_automezzi','create_draft_edenred_uta',
+                 'create_draft_enilive')
               AND success=1 AND dry_run=0
               AND NOT EXISTS (
                   SELECT 1 FROM odoo_writes ow2
@@ -1029,22 +1034,26 @@ def api_odoo_draft_automezzi(analysis_id):
         writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
         result = writer.create_bozza_automezzi(analysis, mapping)
 
-        # Salva audit
+        # Salva audit (con added_po_line_ids per il pattern Leasys aggregato:
+        # se il writer ha creato POL ad-hoc per voci extra (bolli/penali), il
+        # rollback automatico le deve poter eliminare via _cleanup_extra_pols)
+        added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                          if result.added_po_line_ids else None)
         extra_pol_json = (json.dumps(result.extra_po_lines)
                             if result.extra_po_lines else None)
         conn.execute("""
             INSERT INTO odoo_writes
             (analysis_id, timestamp, action, success, move_id, po_line_id,
              old_price_unit, old_name, old_date_planned,
-             error_message, dry_run, extra_po_lines_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             error_message, dry_run, added_po_line_ids, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             analysis_id, datetime.now().isoformat(),
             result.action, 1 if result.success else 0,
             result.move_id, result.po_line_id,
             result.old_price_unit, result.old_name, result.old_date_planned,
             result.error_message, 1 if result.dry_run else 0,
-            extra_pol_json,
+            added_pol_csv, extra_pol_json,
         ))
         conn.commit()
         return jsonify(result.to_dict()), (200 if result.success else 500)
@@ -1099,6 +1108,139 @@ def api_odoo_draft_telepass_canoni(analysis_id):
         result = writer.create_bozza_telepass_canoni(analysis, resolved)
 
         # Log su odoo_writes (consume-POL multi-line: salvo old_* della 1ª POL
+        # + extra_po_lines_json per le altre)
+        extra_pol_json = (json.dumps(result.extra_po_lines)
+                            if result.extra_po_lines else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_enilive/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_enilive(analysis_id):
+    """Crea bozza per fattura carte carburante Enilive S.p.A.
+    (IT11403240960).
+
+    Pattern analogo a Edenred UTA, ma:
+      - Dettaglio carta-per-carta sta nel PDF allegato (parsato da
+        core.enilive_pdf_parser), non nelle righe XML.
+      - POL pre-pianificate quindicinali su P03731 con keyword
+        AUTOMEZZI/AUTOVETTURE: match per periodo.
+      - FEE SICUREZZA E GEST: POL creata ad-hoc (account 420190, product 12202).
+
+    Mappa carte Enilive in input/carte_enilive.xlsx (auto-refresh su mtime
+    via config/carte_enilive_mapping.py).
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import MAPPATURA_FORNITORI_FISSI, ODOO_WRITE_DRY_RUN
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip()
+        if cedente_vat != 'IT11403240960':
+            return jsonify({'success': False,
+                            'error': f"P.IVA {cedente_vat} non è Enilive"}), 400
+        mapping_entry = MAPPATURA_FORNITORI_FISSI.get(cedente_vat)
+        if not mapping_entry:
+            return jsonify({'success': False,
+                            'error': "Enilive non in MAPPATURA_FORNITORI_FISSI"}), 400
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_enilive(analysis, mapping_entry)
+
+        # Log su odoo_writes: consume-POL multi-line in extra_po_lines_json +
+        # POL SERVIZIO CREATA tracciata in added_po_line_ids per il rollback
+        # (lo schema added_po_line_ids serve a _cleanup_extra_pols di unlinkare
+        # la POL creata quando si rolla la bozza).
+        extra_pol_json = (json.dumps(result.extra_po_lines)
+                            if result.extra_po_lines else None)
+        added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                          if result.added_po_line_ids else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, added_po_line_ids, extra_po_lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            added_pol_csv, extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_edenred_uta/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_edenred_uta(analysis_id):
+    """Crea bozza per fattura carte carburante Edenred UTA Mobility
+    (IT01696270212).
+
+    Pattern: aggregazione ~114 righe XML in max 4 voci semantiche per
+    classificazione fiscale (POOL/uso_promiscuo/super_lusso/SERVIZIO).
+    Consume-POL multi-line su P03735 con riscrittura nome+prezzo+tax
+    delle POL libere pre-pianificate da Acquisti.
+
+    Mappa carte UTA in config/carte_carburante_mapping.py (rigenerata da
+    scripts/generate_carte_carburante_mapping.py partendo da
+    input/carte_uta.xlsx).
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import MAPPATURA_FORNITORI_FISSI, ODOO_WRITE_DRY_RUN
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip()
+        if cedente_vat != 'IT01696270212':
+            return jsonify({'success': False,
+                            'error': f"P.IVA {cedente_vat} non è Edenred UTA"}), 400
+        mapping_entry = MAPPATURA_FORNITORI_FISSI.get(cedente_vat)
+        if not mapping_entry:
+            return jsonify({'success': False,
+                            'error': "Edenred UTA non in MAPPATURA_FORNITORI_FISSI"}), 400
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_edenred_uta(analysis, mapping_entry)
+
+        # Log su odoo_writes (consume-POL multi-line: 1ª POL nei campi singolari
         # + extra_po_lines_json per le altre)
         extra_pol_json = (json.dumps(result.extra_po_lines)
                             if result.extra_po_lines else None)
@@ -1412,7 +1554,10 @@ def api_odoo_bulk_create_drafts(run_id):
 
             try:
                 writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
-                if mapping_raw.get('multi_contratto'):
+                needs_multilinea = (mapping_raw.get('multi_contratto')
+                                    or mapping_raw.get('line_groups')
+                                    or mapping_raw.get('line_groups_by_month'))
+                if needs_multilinea:
                     result = writer.create_bozza_multilinea(analysis, mapping)
                 else:
                     result = writer.create_bozza_fornitore_fisso(analysis, mapping)

@@ -166,6 +166,22 @@ Helper: `_build_extra_lines_from_keyword_matches` (in `core/fatturapa_analyzer.p
 
 Effetto deploy 05-05: 30/57 fatture Rema Tarlazzi non-registered passate da AUTO_VALIDABILE (write bloccato) a MATCH_PARZIALE_OK (write OK con POL accessoria automatica). Pattern generale: si applica a qualunque fornitore con stesso schema.
 
+### Consumo subset OdA + accessorie non modellate → MATCH_PARZIALE_OK (fix 19-05-2026, P1)
+
+Estensione di `_try_oda_ledger_subset_match` (`core/fatturapa_analyzer.py`): la ricerca del subset di POL libere viene fatta su **target = imponibile_fattura − Σ(righe XML keyword-classified)** invece che sull'imponibile lordo. Le righe accessorie (TRASPORTO/ONERI_BANCARI/BOLLO) vengono passate al writer come `partial_extra_lines`, così `_add_extra_pol_to_oda` crea automaticamente le POL extra accessorie sull'OdA.
+
+Sblocca il pattern "fattura consuma N POL su M dell'OdA + porta 1-2 righe accessorie non previste nell'OdA". Casi sbloccati al deploy 19-05: Wuerth 4504241895 €72,48 / 4504241896 €136,42 (3 POL consumate + €7 trasporto), CONRAD 261020767 €661 (6 POL su 8, no accessorie).
+
+Per supportare il caso CONRAD (subset 6/8 POL) `_find_subset_match` ha una nuova **FASE 4b complement-search**: quando `len(items) >= 6` e target è vicino al totale, cerca un piccolo subset di righe da ESCLUDERE (combinatoria k ≤ 4 sul complemento) invece che da includere. Equivalente matematicamente, molto più veloce.
+
+### Cumulativo run con accessorie → PARZIALE_CUMULATIVO_OK (fix 19-05-2026, P4)
+
+Estensione di `apply_run_cumulative_check` (`core/fatturapa_analyzer.py`): quando 2+ fatture della run puntano allo stesso OdA esplicito e il loro totale cumulato eccede l'OdA, prima di marcare `CUMULATIVO_ECCEDE` viene calcolato `eccesso_netto = eccesso_lordo − Σ(accessorie cumulate del gruppo)`. Se `eccesso_netto ≤ tolleranza`, tutte le fatture del gruppo vengono declassate a `PARZIALE_CUMULATIVO_OK` e ciascuna riceve `partial_extra_lines` con le sue righe accessorie.
+
+Il writer `create_bozza_da_oda_matched` aggiunge `PARZIALE_CUMULATIVO_OK` alla lista delle classificazioni che attivano `is_partial_with_extras` (oltre a `MATCH_PARZIALE_OK`), così le POL extra trasporto vengono create automaticamente sull'OdA.
+
+Caso sbloccato al deploy 19-05: Coel Distribution P04626 con coppia di fatture 26VEN01073 €341,84 + 26VEN01074 €147,94. Insieme consumano l'OdA completo (€370,46 imponibile) + €31 trasporti accessori. Eccesso netto = 0 → entrambe `PARZIALE_CUMULATIVO_OK`.
+
 ### Note di credito (TD04)
 
 Gestione particolare:
@@ -253,7 +269,7 @@ python -c "import ast; ast.parse(open('core/odoo_writer.py').read()); print('OK'
 
 - `config/credentials.env` contiene `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_PASSWORD`. **Mai committare** (è nel .gitignore se Git verrà attivato).
 - La webapp sul server è esposta sulla porta 80 senza autenticazione. Chiunque in rete aziendale può creare bozze. **Aggiungere login** è un task aperto prioritario una volta consolidato il flusso.
-- Utente Odoo attualmente usato per l'agent: `lranalletta@ecotelitalia.it` (utente reale, non di servizio). **Da migrare** a service account dedicato (es. `agent_fatture@ecotelitalia.it`) per audit e sicurezza.
+- Utente Odoo attualmente usato per l'agent: **`admin`** (utente super-administrator tecnico, id=2, email `sistemi-informativi@ecotelitalia.it`). **Privilegi pieni su tutto Odoo** — un bug nell'agent può scrivere ovunque. Nell'audit trail `mail.message` le bozze risultano create da "Administrator", che è proprio questo utente. **Da migrare** a service account dedicato (es. `agent_fatture@ecotelitalia.it`) per audit chiaro e principio del minimo privilegio.
 
 ---
 
@@ -267,7 +283,7 @@ python -c "import ast; ast.parse(open('core/odoo_writer.py').read()); print('OK'
 6. **Email contabili** (parametri SMTP da chiedere a IT)
 7. **Fase 2 — matching commesse S#####** (sale.order per imputazione costi a progetti)
 8. **Estensione a fornitori non-OdA** (utenze, leasing, ecc.)
-9. **Utente Odoo dedicato** (service account)
+9. **Utente Odoo dedicato** (service account) — oggi l'agent gira come `admin` (super-administrator), prioritario per audit e sicurezza
 10. **Git + repo aziendale** per eliminare copy-paste RDP
 
 ---

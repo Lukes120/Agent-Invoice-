@@ -531,6 +531,23 @@ class OdooWriter:
             logger.warning(f"_end_of_month errore su '{date_str}': {e}")
             return date_str
 
+    def _italian_month_from_iso(self, date_str: str) -> str:
+        """
+        Dato '2026-05-08' ritorna 'Maggio'.
+        Usato per il routing POL di WE4SERVICES (P03696) dove le righe
+        placeholder libere mensili hanno il nome del mese in italiano.
+        """
+        _MONTHS_IT = ['', 'Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio',
+                      'Giugno', 'Luglio', 'Agosto', 'Settembre', 'Ottobre',
+                      'Novembre', 'Dicembre']
+        if not date_str or '-' not in date_str:
+            return ''
+        try:
+            m = int(date_str.split('-')[1])
+            return _MONTHS_IT[m] if 1 <= m <= 12 else ''
+        except Exception:
+            return ''
+
     def _data_contabile(self, analysis, invoice_date: str) -> str:
         """
         Convenzione Ecotel (decisa 2026-05-04 con contabilità):
@@ -887,6 +904,22 @@ class OdooWriter:
         kw = keyword.lower()
         for l in libere:
             if kw in (l.get('name', '') or '').lower():
+                return l
+        return None
+
+    def _find_po_line_by_keywords_all(self, libere, keywords):
+        """
+        Tra le righe libere, trova la prima la cui descrizione contiene
+        TUTTE le keyword in AND (case-insensitive). Stabile sull'ordine
+        in lista libere (già ordinata per id crescente nel reader): garantisce
+        FIFO sulle POL gemelle (es. P03696 ha 2 POL identiche per mese/tipo).
+        """
+        kws = [k.lower() for k in keywords if k]
+        if not kws:
+            return None
+        for l in libere:
+            name = (l.get('name', '') or '').lower()
+            if all(k in name for k in kws):
                 return l
         return None
 
@@ -1276,6 +1309,60 @@ class OdooWriter:
                     'old_date_planned': po_line.get('date_planned'),
                     'is_new': False,
                 })
+        elif mapping_entry.get('line_groups_by_month'):
+            # WE4SERVICES P03696: routing 2D. Per ogni gruppo (Oneri/FEE)
+            # raggruppo le righe XML che matchano la keyword tipo, poi
+            # cerco la PO line LIBERA che contiene ENTRAMBE le keyword:
+            # tipo (es. "Oneri Factoring") + mese italiano della data fattura
+            # (es. "Maggio"). La tax usata è quella della POL libera stessa
+            # (Oneri esente [54], FEE 22% [11]).
+            month_label = self._italian_month_from_iso(invoice_date)
+            if not month_label:
+                return WriteResult(
+                    success=False, action='create_draft',
+                    error_message=f"Impossibile estrarre mese italiano da "
+                                 f"data fattura '{invoice_date}'",
+                    dry_run=self.dry_run)
+            month_groups = mapping_entry['line_groups_by_month']
+            month_assignments = self._match_lines_to_groups(main_lines, month_groups)
+            desc_strategy = mapping_entry.get('description_strategy', '')
+            for i, group_cfg in enumerate(month_groups):
+                group_lines = month_assignments.get(i, [])
+                if not group_lines:
+                    continue
+                amount = sum(r.prezzo_totale for r in group_lines)
+                if amount == 0:
+                    continue
+                # Match AND: tipo + mese
+                po_line = self._find_po_line_by_keywords_all(
+                    libere, [group_cfg['match'], month_label])
+                if not po_line:
+                    return WriteResult(
+                        success=False, action='create_draft',
+                        error_message=f"Nessuna POL libera in {oda_name} "
+                                     f"per '{group_cfg['match']}' mese '{month_label}' "
+                                     f"(POL esaurite o mese non previsto)",
+                        dry_run=self.dry_run)
+                libere = [l for l in libere if l['id'] != po_line['id']]
+                # Tax: usa quella della POL libera (già corretta in OdA)
+                pl_taxes = po_line.get('taxes_id') or mapping_entry['taxes_id']
+                # Descrizione: keep_original_with_ref → append numero fattura
+                base_desc = po_line.get('name', '') or ''
+                if desc_strategy == 'keep_original_with_ref' and invoice_number:
+                    description = f"{base_desc} (rif.ft {invoice_number})"
+                else:
+                    description = base_desc
+                assignments.append({
+                    'po_line': po_line,
+                    'amount': -amount if is_nota_credito else amount,
+                    'move_amount': -amount if is_nota_credito else amount,
+                    'description': description,
+                    'taxes_id': list(pl_taxes),
+                    'old_price': po_line.get('price_unit', 0),
+                    'old_name': base_desc,
+                    'old_date_planned': po_line.get('date_planned'),
+                    'is_new': False,
+                })
         elif mapping_entry.get('lines_one_to_one'):
             # 1 riga XML → 1 riga libera (in ordine). Adatto a OdA-ledger
             # mensili (es. Wind Tre Professional Full: fattura mensile con
@@ -1364,7 +1451,7 @@ class OdooWriter:
                 pl_id = a['po_line']['id'] if a['po_line'] else 'NEW'
                 logger.info(f"[DRY_RUN] multilinea [{tipo_str}]: "
                            f"PO line {pl_id}: amount={a['amount']}, "
-                           f"desc='{a['description'][:50]}', taxes={a['taxes_id']}")
+                           f"desc='{a['description'][:120]}', taxes={a['taxes_id']}")
             return WriteResult(
                 success=True, action='create_draft',
                 move_id=None, po_line_id=primary_po_line_id,
@@ -1669,8 +1756,11 @@ class OdooWriter:
         from config.rules import ADD_EXTRA_POL_TO_ODA_ENABLED
         added_po_line_ids = []
         partial_extra_lines = getattr(analysis, 'partial_extra_lines', None) or []
+        # PARZIALE_CUMULATIVO_OK incluso: apply_run_cumulative_check (P4) popola
+        # partial_extra_lines quando l'eccesso del gruppo cumulativo e' spiegato
+        # da accessorie. Stesso pattern, stesso writer-flow.
         is_partial_with_extras = (
-            analysis.classification == 'MATCH_PARZIALE_OK'
+            analysis.classification in ('MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK')
             and partial_extra_lines
             and ADD_EXTRA_POL_TO_ODA_ENABLED)
 
@@ -3225,6 +3315,12 @@ class OdooWriter:
             return WriteResult(success=False, action='create_draft_automezzi',
                                error_message=f"P.IVA {vat} non in MAPPATURA_AUTOMEZZI",
                                dry_run=self.dry_run)
+
+        # Dispatch Leasys aggregato: per IT06714021000 si usa il pattern
+        # "4 POL canoni aggregate + N POL extra ad-hoc" anziché "1 POL per riga"
+        # (deciso 13/05/2026 — vedi memoria project_session_2026_05_13_leasys_refactor).
+        if vat == 'IT06714021000':
+            return self._create_bozza_leasys_aggregated(analysis, mapping_entry)
 
         nome_forn = mapping_entry.get('nome', vat)
 
@@ -4790,3 +4886,1609 @@ class OdooWriter:
                 success=False, action='create_draft_libera',
                 error_message=str(e), dry_run=False,
             )
+
+    # === Edenred UTA Mobility — carte carburante === #
+    #
+    # Routing fiscale Ecotel (verificato su move posted ACQ/2026/1898 e altre):
+    #   classificazione    -> conto Odoo    + tax  + deducib.
+    #   POOL (furgoni)        410300 id=358   11      100%
+    #   uso_promiscuo         410410 id=1125  11       70%
+    #   super_lusso           410400 id=359   73       20% (IVA indetraibile 60%)
+    #   SERVIZIO              420190 id=1190  11      100% (servizi vari)
+    _EDENRED_UTA_ROUTING = {
+        'POOL':          {'account_id': 358,  'tax_id': 11, 'pol_keyword': 'furgoni'},
+        'uso_promiscuo': {'account_id': 1125, 'tax_id': 11, 'pol_keyword': 'uso promiscuo'},
+        'super_lusso':   {'account_id': 359,  'tax_id': 73, 'pol_keyword': 'uso amministratore'},
+        'SERVIZIO':      {'account_id': 1190, 'tax_id': 11, 'pol_keyword': 'servizio'},
+    }
+
+    @staticmethod
+    def _classify_carta_uta(numero_carta: str) -> Optional[str]:
+        """Lookup classificazione carta UTA da config/carte_carburante_mapping.py.
+
+        Ritorna 'POOL' / 'uso_promiscuo' / 'super_lusso' / 'SERVIZIO'
+        oppure None se la carta non è in mappa (riga da censire).
+        """
+        if not numero_carta:
+            return None
+        try:
+            from config.carte_carburante_mapping import get_classificazione_carta_uta
+        except ImportError:
+            return None
+        return get_classificazione_carta_uta(str(numero_carta).strip())
+
+    def create_bozza_edenred_uta(self, analysis,
+                                    mapping_entry: Dict) -> WriteResult:
+        """Crea bozza per fattura carte carburante Edenred UTA Mobility
+        (IT01696270212).
+
+        Pattern: ~114 righe XML di rifornimenti singoli → aggregazione per
+        classificazione fiscale (POOL/uso_promiscuo/super_lusso/SERVIZIO)
+        → max 4 voci move_line. Consume-POL multi-line su P03735 con POL
+        pre-pianificate da Acquisti già semantiche (name "Costo carburante
+        ft.n. XXX\n{classe}").
+
+        Steps per ogni riga XML:
+          1. Estrai numero_carta da <RiferimentoAmministrazione>
+          2. Lookup classificazione (CARTE_UTA_BY_NUMERO)
+             - Carta non trovata -> warning, fallback 'uso_promiscuo'
+             - Riga senza RiferimentoAmministrazione -> 'SERVIZIO'
+          3. Aggrega prezzo_totale per (classificazione)
+        Steps di scrittura:
+          1. Per ogni classificazione aggregata, cerca POL libera su P03735
+             con name contenente la keyword (furgoni / uso promiscuo /
+             uso amministratore / servizio)
+          2. Riscrive POL: name="Costo carburante ft.n. {numero_fattura}\n{classe}"
+             (preserva pattern storico), price_unit=totale_classe, taxes_id,
+             qty_received=1
+          3. Crea move_line per ciascuna classe con account_id, tax, qty=1,
+             purchase_line_id collegato
+
+        Returns WriteResult con po_line_id primaria + extra_po_lines (le altre).
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc != 'TD01':
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message=f"Tipo {tipo_doc} non supportato "
+                                             f"(atteso TD01)",
+                               dry_run=self.dry_run)
+
+        vat = (analysis.xml_data.cedente_partita_iva or '').strip().upper()
+        if vat != 'IT01696270212':
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message=f"P.IVA {vat} non Edenred UTA",
+                               dry_run=self.dry_run)
+
+        righe = analysis.xml_data.righe or []
+        if not righe:
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message="Nessuna riga in XML",
+                               dry_run=self.dry_run)
+
+        nome_forn = mapping_entry.get('nome', 'Edenred UTA Mobility S.r.l.')
+        oda_name = mapping_entry.get('oda_fisso', 'P03735')
+
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+
+        # === Fase 1: aggrego per classificazione ===
+        agg = {}   # cls -> {'totale': float, 'n_righe': int, 'carte': set, 'note_carte_missing': set}
+        carte_non_mappate = set()
+        righe_senza_carta = 0
+
+        for riga in righe:
+            numero_carta = ''
+            adg = getattr(riga, 'altri_dati_gestionali', None) or {}
+            # Provo a estrarre RiferimentoAmministrazione: il parser di solito
+            # mette il valore in altri_dati_gestionali sotto chiave "TIPO_VALORE",
+            # ma per Edenred UTA il riferimento amministrazione è un campo
+            # diretto della riga (non un AltriDatiGestionali). Lo prendo da
+            # un attributo del FatturaPALine se esiste.
+            numero_carta = (
+                getattr(riga, 'riferimento_amministrazione', '') or
+                adg.get('RIFERIMENTO_AMMINISTRAZIONE') or
+                adg.get('Riferimento_Amministrazione') or
+                ''
+            )
+            numero_carta = str(numero_carta).strip()
+
+            classif = None
+            if numero_carta:
+                classif = self._classify_carta_uta(numero_carta)
+                if classif is None:
+                    # Carta non mappata: fallback conservativo + segnalazione
+                    carte_non_mappate.add(numero_carta)
+                    classif = 'uso_promiscuo'
+            else:
+                # Riga senza riferimento carta = SERVIZIO (fee, gestione, ecc.)
+                righe_senza_carta += 1
+                classif = 'SERVIZIO'
+
+            prezzo = float(getattr(riga, 'prezzo_totale', 0) or
+                            getattr(riga, 'prezzo_unitario', 0) or 0)
+            if classif not in agg:
+                agg[classif] = {'totale': 0.0, 'n_righe': 0, 'carte': set()}
+            agg[classif]['totale'] += prezzo
+            agg[classif]['n_righe'] += 1
+            if numero_carta:
+                agg[classif]['carte'].add(numero_carta)
+
+        if not agg:
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message="Nessuna riga aggregabile",
+                               dry_run=self.dry_run)
+
+        # === Fase 2: trova OdA + POL libere ===
+        ECOTEL = 1
+        pos = self.client._call('purchase.order', 'search_read',
+            [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+            fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+            limit=1)
+        if not pos:
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message=f"OdA {oda_name} non trovato su Ecotel",
+                               dry_run=self.dry_run)
+        po = pos[0]
+        po_id = po['id']
+        partner_id = (po['partner_id'][0]
+                       if isinstance(po['partner_id'], list) else None)
+        currency_id = (po['currency_id'][0]
+                        if isinstance(po['currency_id'], list) else None)
+        if not partner_id:
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message=f"OdA {oda_name} senza partner",
+                               dry_run=self.dry_run)
+
+        libere = self._find_libere_purchase_order_lines(po_id, 'standard_qty_inv_rec')
+        if len(libere) < len(agg):
+            return WriteResult(success=False,
+                               action='create_draft_edenred_uta',
+                               error_message=(
+                                   f"POL libere insufficienti su {oda_name}: "
+                                   f"{len(libere)} disponibili, {len(agg)} servono "
+                                   f"(1 per classificazione: {list(agg.keys())}). "
+                                   f"Acquisti deve aggiungere altre POL TEST a {oda_name}."),
+                               dry_run=self.dry_run)
+
+        # === Fase 3: match POL per classe via keyword nel name ===
+        # Per ogni classe agg, cerco la prima POL libera il cui name contiene
+        # la keyword associata (es. 'furgoni' per POOL).
+        consumed_pol_info = []
+        move_lines_vals = []
+        used_pol_ids = set()
+
+        # Preferisco ordine fisso (POOL, uso_promiscuo, super_lusso, SERVIZIO)
+        # per stabilità in output e nei test.
+        ORDER = ['POOL', 'uso_promiscuo', 'super_lusso', 'SERVIZIO']
+        classi_ordinate = [c for c in ORDER if c in agg]
+
+        for classif in classi_ordinate:
+            info_cls = agg[classif]
+            routing = self._EDENRED_UTA_ROUTING.get(classif)
+            if not routing:
+                return WriteResult(success=False,
+                                   action='create_draft_edenred_uta',
+                                   error_message=f"Routing non definito per classe {classif!r}",
+                                   dry_run=self.dry_run)
+
+            keyword = routing['pol_keyword'].lower()
+            account_id = routing['account_id']
+            tax_id = routing['tax_id']
+
+            # Cerca POL libera con name contenente la keyword
+            pol = None
+            for cand in libere:
+                if cand['id'] in used_pol_ids:
+                    continue
+                cand_name = (cand.get('name') or '').lower()
+                if keyword in cand_name:
+                    pol = cand
+                    break
+            # Fallback: prima POL libera disponibile (se nessuna matcha la keyword)
+            if pol is None:
+                for cand in libere:
+                    if cand['id'] not in used_pol_ids:
+                        pol = cand
+                        break
+            if pol is None:
+                return WriteResult(success=False,
+                                   action='create_draft_edenred_uta',
+                                   error_message=(
+                                       f"Nessuna POL libera per classe {classif!r} "
+                                       f"(keyword '{keyword}') su {oda_name}"),
+                                   dry_run=self.dry_run)
+            used_pol_ids.add(pol['id'])
+
+            # name move_line + POL: pattern storico Ecotel
+            # "Costo carburante ft.n. {numero_fattura}\n{classe leggibile}"
+            # Per SERVIZIO uso "Costo servizio \nft.n. {numero}"
+            classe_label = {
+                'POOL': 'furgoni',
+                'uso_promiscuo': 'uso promiscuo',
+                'super_lusso': 'uso amministratore',
+                'SERVIZIO': '',  # gestione speciale
+            }.get(classif, classif)
+            if classif == 'SERVIZIO':
+                new_name = f"Costo servizio \nft.n. {invoice_number}"
+            else:
+                new_name = f"Costo carburante ft.n. {invoice_number}\n{classe_label}"
+
+            price = round(info_cls['totale'], 2)
+
+            # Estraggo product/uom/analytic dalla POL per move_line
+            _prod = pol.get('product_id')
+            product_id = _prod[0] if isinstance(_prod, list) else _prod
+            _uom = pol.get('product_uom')
+            product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+            _aa = pol.get('account_analytic_id')
+            analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+
+            consumed_pol_info.append({
+                'po_line_id': pol['id'],
+                'oda_name': oda_name,
+                'classif': classif,
+                'old_price_unit': pol.get('price_unit') or 0,
+                'old_name': pol.get('name') or '',
+                'old_date_planned': pol.get('date_planned') or None,
+                'old_taxes_id': list(pol.get('taxes_id') or []),
+                'new_price': price,
+                'new_name': new_name,
+                'new_tax_id': tax_id,
+                'account_id': account_id,
+                'product_id': product_id,
+                'product_uom_id': product_uom_id,
+                'analytic_account_id': analytic_id,
+                'n_righe_aggregate': info_cls['n_righe'],
+                'n_carte_distinte': len(info_cls['carte']),
+            })
+
+            ml_vals = {
+                'name': new_name,
+                'account_id': account_id,
+                'price_unit': price,
+                'quantity': 1,
+                'tax_ids': [(6, 0, [tax_id])],
+                'purchase_line_id': pol['id'],
+            }
+            if product_id:
+                ml_vals['product_id'] = product_id
+            if product_uom_id:
+                ml_vals['product_uom_id'] = product_uom_id
+            if analytic_id:
+                ml_vals['analytic_account_id'] = analytic_id
+            move_lines_vals.append(ml_vals)
+
+        # === Fase 4: build move_vals ===
+        move_vals = {
+            'move_type': 'in_invoice',
+            'partner_id': partner_id,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': oda_name,
+            'journal_id': mapping_entry.get('journal_id', 2),
+            'company_id': ECOTEL,
+            'currency_id': currency_id,
+            'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
+        }
+
+        # === DRY-RUN ===
+        if self.dry_run:
+            tot = sum(ml['price_unit'] for ml in move_lines_vals)
+            consumed_str = '; '.join(
+                f"POL {p['po_line_id']} {p['classif']} "
+                f"EUR{p['old_price_unit']:.2f}->EUR{p['new_price']:.2f} "
+                f"tax{p['new_tax_id']} acc{p['account_id']} "
+                f"(n_righe={p['n_righe_aggregate']}, n_carte={p['n_carte_distinte']})"
+                for p in consumed_pol_info)
+            logger.info(
+                f"[DRY_RUN] create_bozza_edenred_uta fornitore={nome_forn} "
+                f"OdA={oda_name} classi={len(move_lines_vals)} "
+                f"tot_imponibile={tot:.2f} consume-POL=[{consumed_str}]")
+            if carte_non_mappate:
+                logger.warning(
+                    f"[DRY_RUN] {len(carte_non_mappate)} carte NON in mappa "
+                    f"(fallback uso_promiscuo): {sorted(carte_non_mappate)[:10]}")
+            if righe_senza_carta:
+                logger.info(
+                    f"[DRY_RUN] {righe_senza_carta} righe senza RiferimentoAmministrazione "
+                    f"-> SERVIZIO")
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['classif']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True, action='create_draft_edenred_uta',
+                               move_id=None, dry_run=True,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+
+        # === SCRITTURA REALE ===
+        try:
+            for p in consumed_pol_info:
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'taxes_id': [(6, 0, [p['new_tax_id']])],
+                        'product_qty': 1,
+                        'qty_received': 1,
+                        'qty_received_manual': 1,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(
+                    f"Updated POL {p['po_line_id']} {p['classif']}: "
+                    f"price={p['new_price']:.2f} acc={p['account_id']} tax={p['new_tax_id']}")
+
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(
+                f"Created Edenred UTA move {move_id} OdA={oda_name} "
+                f"consume-POL ids={[p['po_line_id'] for p in consumed_pol_info]}")
+
+            # Allego XML
+            if analysis.raw_xml:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito: {e}")
+
+            # Marca fatturapa registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito: {e}")
+
+            if carte_non_mappate:
+                logger.warning(
+                    f"Edenred UTA: {len(carte_non_mappate)} carte NON in mappa "
+                    f"(fallback uso_promiscuo): {sorted(carte_non_mappate)[:10]}. "
+                    f"Aggiornare input/carte_uta.xlsx.")
+
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['classif']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(success=True, action='create_draft_edenred_uta',
+                               move_id=move_id, dry_run=False,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None)
+        except Exception as e:
+            logger.exception("Errore create_bozza_edenred_uta")
+            # Rollback POL
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'taxes_id': [(6, 0, p['old_taxes_id'])],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            return WriteResult(success=False, action='create_draft_edenred_uta',
+                               error_message=str(e), dry_run=False)
+
+    # ================================================================
+    # === ENILIVE S.P.A. (IT11403240960) — carte carburante via PDF ===
+    # ================================================================
+    #
+    # Differenza dal pattern Edenred UTA:
+    #   - L'XML FatturaPA Enilive contiene SOLO righe aggregate per prodotto
+    #     (BENZSP/DIESEL/ADBLUE/FEE), zero <RiferimentoAmministrazione>.
+    #   - Il dettaglio carta-per-carta è SOLO nel PDF allegato. Lo parsa
+    #     core.enilive_pdf_parser e ne ricava EniliveBreakdown.
+    #   - L'OdA-ledger P03731 ha POL pre-pianificate quindicinali con
+    #     keyword "AUTOMEZZI" (= POOL) e "AUTOVETTURE" (= uso_promiscuo).
+    #     Per la fee servizio (FEE SICUREZZA E GEST) Acquisti NON crea POL:
+    #     il writer la crea ad-hoc (added_po_line_ids per rollback).
+    #
+    # Routing fiscale Ecotel (identico a Edenred UTA):
+    #   POOL          -> 410300 id=358   tax 11
+    #   uso_promiscuo -> 410410 id=1125  tax 11
+    #   super_lusso   -> 410400 id=359   tax 73
+    #   SERVIZIO      -> 420190 id=1190  tax 11  (POL NUOVA, product 12202)
+    _ENILIVE_ROUTING = {
+        'POOL':          {'account_id': 358,  'tax_id': 11, 'pol_keyword': 'automezzi'},
+        'uso_promiscuo': {'account_id': 1125, 'tax_id': 11, 'pol_keyword': 'autovetture'},
+        'super_lusso':   {'account_id': 359,  'tax_id': 73, 'pol_keyword': 'amministratore'},
+        'SERVIZIO':      {'account_id': 1190, 'tax_id': 11,
+                          # POL NUOVA da creare: usa "Fornitura di Servizi"
+                          # (id 12202, uom 68 PZ) che è il product già usato
+                          # sulle altre POL P03731 (uniforme).
+                          'new_pol_product_id': 12202,
+                          'new_pol_product_uom_id': 68},
+    }
+
+    _RE_ENILIVE_POL_PERIOD = re.compile(
+        r'dal\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _enilive_pol_period_includes(cls, pol_name: str, invoice_date_iso: str) -> bool:
+        """True se il name della POL contiene un range 'dal X al Y' (DD/MM/YYYY)
+        e invoice_date (YYYY-MM-DD) cade dentro quel range (incluso).
+
+        Ritorna False se il name non ha un range (la POL non è quindicinale,
+        es. 'Canone TRIM').
+        """
+        if not pol_name or not invoice_date_iso:
+            return False
+        m = cls._RE_ENILIVE_POL_PERIOD.search(pol_name)
+        if not m:
+            return False
+        try:
+            from datetime import date
+            d_from = date(int(m.group(1)[6:10]), int(m.group(1)[3:5]),
+                          int(m.group(1)[0:2]))
+            d_to   = date(int(m.group(2)[6:10]), int(m.group(2)[3:5]),
+                          int(m.group(2)[0:2]))
+            y, mth, dd = invoice_date_iso.split('-')
+            d_inv = date(int(y), int(mth), int(dd))
+        except Exception:
+            return False
+        return d_from <= d_inv <= d_to
+
+    def _match_enilive_pol_for_classe(self, libere: List[Dict], classe: str,
+                                       invoice_date_iso: str,
+                                       used_pol_ids: set) -> Optional[Dict]:
+        """Match POL libera per Enilive in 3 livelli di priorità:
+          1) name contiene keyword (AUTOMEZZI/AUTOVETTURE) AND
+             range periodo include data fattura
+          2) keyword match ma range non incluso (per fallback)
+          3) keyword match a prescindere dal periodo (caso vecchie POL)
+
+        Ritorna None se nessuna POL libera ha la keyword giusta.
+        """
+        routing = self._ENILIVE_ROUTING.get(classe)
+        if not routing:
+            return None
+        keyword = routing.get('pol_keyword', '').lower()
+        if not keyword:
+            return None
+        with_period_ok = []
+        keyword_only = []
+        for cand in libere:
+            if cand['id'] in used_pol_ids:
+                continue
+            name = (cand.get('name') or '').lower()
+            if keyword not in name:
+                continue
+            if self._enilive_pol_period_includes(cand.get('name') or '',
+                                                   invoice_date_iso):
+                with_period_ok.append(cand)
+            else:
+                keyword_only.append(cand)
+        # Preferenza: periodo OK -> qualsiasi keyword match
+        if with_period_ok:
+            return with_period_ok[0]
+        if keyword_only:
+            return keyword_only[0]
+        return None
+
+    def create_bozza_enilive(self, analysis,
+                              mapping_entry: Dict) -> WriteResult:
+        """Crea bozza per fattura carte carburante Enilive S.p.A.
+        (IT11403240960).
+
+        Differenza chiave da create_bozza_edenred_uta: il dettaglio per carta
+        sta nel PDF allegato, non nelle righe XML. Si usa
+        `core.enilive_pdf_parser` per parsare il PDF e ottenere
+        l'EniliveBreakdown (carte + fee_sicurezza + classificazione).
+
+        Steps:
+          1) Estrai PDF allegato da analysis.raw_xml
+          2) Parsa breakdown carte (con classificazione)
+          3) Aggrega per classe POOL/uso_promiscuo/super_lusso
+          4) Per ogni classe match POL libera su P03731 per keyword+periodo:
+             - riscrivi POL (name, price, tax, qty_received=1)
+             - crea move_line collegata
+          5) Se c'è FEE SICUREZZA, crea NUOVA POL (account 420190, product
+             "Fornitura di Servizi"=12202) e relativa move_line
+
+        Returns WriteResult con po_line_id primaria + extra_po_lines per le
+        riassegnazioni + added_po_line_ids per la nuova POL SERVIZIO.
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc != 'TD01':
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=f"Tipo {tipo_doc} non supportato (atteso TD01)",
+                               dry_run=self.dry_run)
+
+        vat = (analysis.xml_data.cedente_partita_iva or '').strip().upper()
+        if vat != 'IT11403240960':
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=f"P.IVA {vat} non Enilive",
+                               dry_run=self.dry_run)
+
+        # === Fase 0: parsing PDF allegato ===
+        from core.enilive_pdf_parser import (
+            extract_attached_pdf_from_xml, parse_enilive_pdf,
+        )
+        pdf_bytes = extract_attached_pdf_from_xml(analysis.raw_xml or '')
+        if not pdf_bytes:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message="PDF allegato non trovato nella fattura XML",
+                               dry_run=self.dry_run)
+        try:
+            breakdown = parse_enilive_pdf(pdf_bytes)
+        except Exception as e:
+            logger.exception("Errore parsing PDF Enilive")
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=f"Parsing PDF Enilive fallito: {e}",
+                               dry_run=self.dry_run)
+        if not breakdown.carte:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message="PDF Enilive: nessuna carta estratta",
+                               dry_run=self.dry_run)
+
+        # Aggrego per classe + verifica carte non in mappa
+        agg_classi = breakdown.aggregate_by_classe()
+        carte_non_mappate = list(breakdown.carte_non_in_mappa)
+        # Per ora le carte non in mappa vengono dirottate su uso_promiscuo
+        # (fallback conservativo come Edenred UTA). Se ce ne sono, viene loggato
+        # un warning.
+        if '_NON_IN_MAPPA' in agg_classi:
+            unmapped = agg_classi.pop('_NON_IN_MAPPA')
+            fallback = agg_classi.setdefault('uso_promiscuo', {
+                'imponibile': 0.0, 'iva': 0.0, 'totale': 0.0, 'carte': [],
+            })
+            fallback['imponibile'] = round(fallback['imponibile'] + unmapped['imponibile'], 2)
+            fallback['iva']        = round(fallback['iva']        + unmapped['iva'], 2)
+            fallback['totale']     = round(fallback['totale']     + unmapped['totale'], 2)
+            fallback['carte'].extend(unmapped['carte'])
+
+        nome_forn = mapping_entry.get('nome', 'Enilive S.p.A.')
+        oda_name = mapping_entry.get('oda_fisso', 'P03731')
+
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+
+        # === Fase 1: trovo OdA + POL libere ===
+        ECOTEL = 1
+        pos = self.client._call('purchase.order', 'search_read',
+            [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+            fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+            limit=1)
+        if not pos:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=f"OdA {oda_name} non trovato su Ecotel",
+                               dry_run=self.dry_run)
+        po = pos[0]
+        po_id = po['id']
+        partner_id = (po['partner_id'][0]
+                       if isinstance(po['partner_id'], list) else None)
+        currency_id = (po['currency_id'][0]
+                        if isinstance(po['currency_id'], list) else None)
+        if not partner_id:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=f"OdA {oda_name} senza partner",
+                               dry_run=self.dry_run)
+
+        libere = self._find_libere_purchase_order_lines(po_id, 'standard_qty_inv_rec')
+
+        # POOL/uso_promiscuo/super_lusso vanno su POL pre-pianificate (cardano).
+        # SERVIZIO va su una NUOVA POL creata ad hoc.
+        classi_cardanti = [c for c in ('POOL', 'uso_promiscuo', 'super_lusso')
+                            if c in agg_classi]
+        n_pol_libere_richieste = len(classi_cardanti)
+        if len(libere) < n_pol_libere_richieste:
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=(
+                                   f"POL libere insufficienti su {oda_name}: "
+                                   f"{len(libere)} disponibili, "
+                                   f"{n_pol_libere_richieste} servono "
+                                   f"(1 per classe cardante: {classi_cardanti})"),
+                               dry_run=self.dry_run)
+
+        # === Fase 2: match POL per classe ===
+        consumed_pol_info = []
+        move_lines_vals = []
+        used_pol_ids: set = set()
+
+        # Ordine fisso per stabilità output (come Edenred UTA)
+        ORDER_CARDANTI = ['POOL', 'uso_promiscuo', 'super_lusso']
+        classi_ordinate = [c for c in ORDER_CARDANTI if c in agg_classi]
+
+        for classif in classi_ordinate:
+            info_cls = agg_classi[classif]
+            routing = self._ENILIVE_ROUTING.get(classif)
+            if not routing:
+                return WriteResult(success=False, action='create_draft_enilive',
+                                   error_message=f"Routing non definito per {classif!r}",
+                                   dry_run=self.dry_run)
+            pol = self._match_enilive_pol_for_classe(libere, classif,
+                                                      invoice_date, used_pol_ids)
+            if pol is None:
+                return WriteResult(success=False, action='create_draft_enilive',
+                                   error_message=(
+                                       f"Nessuna POL libera per classe {classif!r} "
+                                       f"(keyword '{routing['pol_keyword']}') su {oda_name}. "
+                                       f"Servono nuove POL da Acquisti."),
+                                   dry_run=self.dry_run)
+            used_pol_ids.add(pol['id'])
+
+            classe_label_human = {
+                'POOL': 'AUTOMEZZI',
+                'uso_promiscuo': 'AUTOVETTURE',
+                'super_lusso': 'AMMINISTRATORE',
+            }.get(classif, classif)
+            new_name = f"Costo carburante ft.n.{invoice_number} - {classe_label_human}"
+            price = round(info_cls['imponibile'], 2)
+
+            _prod = pol.get('product_id')
+            product_id = _prod[0] if isinstance(_prod, list) else _prod
+            _uom = pol.get('product_uom')
+            product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+            _aa = pol.get('account_analytic_id')
+            analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+
+            consumed_pol_info.append({
+                'po_line_id': pol['id'],
+                'oda_name': oda_name,
+                'classif': classif,
+                'old_price_unit': pol.get('price_unit') or 0,
+                'old_name': pol.get('name') or '',
+                'old_date_planned': pol.get('date_planned') or None,
+                'old_taxes_id': list(pol.get('taxes_id') or []),
+                'new_price': price,
+                'new_name': new_name,
+                'new_tax_id': routing['tax_id'],
+                'account_id': routing['account_id'],
+                'product_id': product_id,
+                'product_uom_id': product_uom_id,
+                'analytic_account_id': analytic_id,
+                'n_carte_distinte': len(info_cls['carte']),
+            })
+
+            ml_vals = {
+                'name': new_name,
+                'account_id': routing['account_id'],
+                'price_unit': price,
+                'quantity': 1,
+                'tax_ids': [(6, 0, [routing['tax_id']])],
+                'purchase_line_id': pol['id'],
+            }
+            if product_id:
+                ml_vals['product_id'] = product_id
+            if product_uom_id:
+                ml_vals['product_uom_id'] = product_uom_id
+            if analytic_id:
+                ml_vals['analytic_account_id'] = analytic_id
+            move_lines_vals.append(ml_vals)
+
+        # === Fase 3: NUOVA POL SERVIZIO (se c'è FEE SICUREZZA) ===
+        new_servizio_pol_id = None
+        new_servizio_pol_info = None
+        if breakdown.fee_sicurezza:
+            srv = self._ENILIVE_ROUTING['SERVIZIO']
+            srv_imponibile = round(breakdown.fee_sicurezza.imponibile, 2)
+            srv_pol_name = f"Fee Sicurezza e Gestione ft.n.{invoice_number}"
+            # account_analytic_id ereditato dalle POL cardanti (tutte le POL di
+            # P03731 condividono lo stesso analytic, es. 4225 S03869).
+            srv_analytic_id = None
+            if consumed_pol_info:
+                srv_analytic_id = consumed_pol_info[0].get('analytic_account_id')
+            if not srv_analytic_id:
+                # Fallback: pesco l'analytic da una POL qualsiasi del PO
+                # (caso degenere: fattura con sola FEE, zero carte).
+                any_pols = self.client._call('purchase.order.line', 'search_read',
+                    [('order_id', '=', po_id)],
+                    fields=['account_analytic_id'], limit=1)
+                if any_pols:
+                    _aa = any_pols[0].get('account_analytic_id')
+                    srv_analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+            new_servizio_pol_info = {
+                'oda_name': oda_name,
+                'order_id': po_id,
+                'name': srv_pol_name,
+                'product_id': srv['new_pol_product_id'],
+                'product_uom': srv['new_pol_product_uom_id'],
+                'product_qty': 1,
+                'price_unit': srv_imponibile,
+                'taxes_id': [(6, 0, [srv['tax_id']])],
+                'date_planned': invoice_date,
+                'analytic_account_id': srv_analytic_id,
+            }
+
+        # === Fase 4: build move_vals ===
+        # Aggiungo la move_line SERVIZIO solo se la POL verrà creata. Per il
+        # DRY-RUN simulo l'id come None; in produzione il purchase_line_id
+        # verrà settato dopo la create della POL.
+        move_vals_base = {
+            'move_type': 'in_invoice',
+            'partner_id': partner_id,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': oda_name,
+            'journal_id': mapping_entry.get('journal_id', 2),
+            'company_id': ECOTEL,
+            'currency_id': currency_id,
+        }
+
+        # === DRY-RUN ===
+        if self.dry_run:
+            tot_lines = sum(ml['price_unit'] for ml in move_lines_vals)
+            if breakdown.fee_sicurezza:
+                tot_lines += breakdown.fee_sicurezza.imponibile
+            consumed_str = '; '.join(
+                f"POL {p['po_line_id']} {p['classif']} "
+                f"EUR{p['old_price_unit']:.2f}->EUR{p['new_price']:.2f} "
+                f"acc{p['account_id']} tax{p['new_tax_id']} (carte={p['n_carte_distinte']})"
+                for p in consumed_pol_info)
+            extra_msg = (f' + new POL SERVIZIO EUR{breakdown.fee_sicurezza.imponibile:.2f}'
+                          if breakdown.fee_sicurezza else '')
+            logger.info(
+                f"[DRY_RUN] create_bozza_enilive fornitore={nome_forn} "
+                f"OdA={oda_name} classi={len(move_lines_vals)} "
+                f"tot_imponibile={tot_lines:.2f} consume-POL=[{consumed_str}]{extra_msg}")
+            if carte_non_mappate:
+                logger.warning(
+                    f"[DRY_RUN] {len(carte_non_mappate)} carte NON in mappa "
+                    f"(fallback uso_promiscuo): {carte_non_mappate}")
+            primary = consumed_pol_info[0] if consumed_pol_info else None
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['classif']}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(
+                success=True, action='create_draft_enilive',
+                move_id=None, dry_run=True,
+                po_line_id=primary['po_line_id'] if primary else None,
+                old_price_unit=primary['old_price_unit'] if primary else None,
+                old_name=primary['old_name'] if primary else None,
+                old_date_planned=primary['old_date_planned'] if primary else None,
+                extra_po_lines=extras or None,
+                # added_po_line_ids: lista di POL CREATE — in dry-run è None
+                # perché la POL SERVIZIO non viene scritta.
+            )
+
+        # === SCRITTURA REALE ===
+        try:
+            # 1) Riscrivo POL cardanti (POOL / uso_promiscuo / super_lusso)
+            for p in consumed_pol_info:
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'taxes_id': [(6, 0, [p['new_tax_id']])],
+                        'product_qty': 1,
+                        'qty_received': 1,
+                        'qty_received_manual': 1,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(
+                    f"Enilive: updated POL {p['po_line_id']} {p['classif']} "
+                    f"price={p['new_price']:.2f} acc={p['account_id']} tax={p['new_tax_id']}")
+
+            # 2) Creo NUOVA POL SERVIZIO (se c'è FEE SICUREZZA)
+            if new_servizio_pol_info:
+                srv = self._ENILIVE_ROUTING['SERVIZIO']
+                new_pol_vals = {
+                    'order_id': po_id,
+                    'name': new_servizio_pol_info['name'],
+                    'product_id': new_servizio_pol_info['product_id'],
+                    'product_uom': new_servizio_pol_info['product_uom'],
+                    'product_qty': new_servizio_pol_info['product_qty'],
+                    'price_unit': new_servizio_pol_info['price_unit'],
+                    'taxes_id': new_servizio_pol_info['taxes_id'],
+                    'date_planned': new_servizio_pol_info['date_planned'],
+                    # qty_received per consumare subito
+                    'qty_received': 1,
+                    'qty_received_manual': 1,
+                }
+                if new_servizio_pol_info.get('analytic_account_id'):
+                    new_pol_vals['account_analytic_id'] = (
+                        new_servizio_pol_info['analytic_account_id'])
+                new_pol_id = self.client._call('purchase.order.line', 'create',
+                                                 new_pol_vals)
+                if isinstance(new_pol_id, list):
+                    new_pol_id = new_pol_id[0] if new_pol_id else None
+                if not new_pol_id:
+                    raise RuntimeError("create POL SERVIZIO returned empty")
+                new_servizio_pol_id = new_pol_id
+                logger.info(
+                    f"Enilive: created NEW POL {new_pol_id} SERVIZIO "
+                    f"price={new_servizio_pol_info['price_unit']:.2f} "
+                    f"on OdA={oda_name}")
+
+                # Aggiungo move_line collegata alla nuova POL
+                ml_vals = {
+                    'name': new_servizio_pol_info['name'],
+                    'account_id': srv['account_id'],
+                    'price_unit': new_servizio_pol_info['price_unit'],
+                    'quantity': 1,
+                    'tax_ids': new_servizio_pol_info['taxes_id'],
+                    'purchase_line_id': new_pol_id,
+                    'product_id': srv['new_pol_product_id'],
+                    'product_uom_id': srv['new_pol_product_uom_id'],
+                }
+                if new_servizio_pol_info.get('analytic_account_id'):
+                    ml_vals['analytic_account_id'] = (
+                        new_servizio_pol_info['analytic_account_id'])
+                move_lines_vals.append(ml_vals)
+
+            # 3) Creo il move
+            move_vals = dict(move_vals_base)
+            move_vals['invoice_line_ids'] = [(0, 0, ml) for ml in move_lines_vals]
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(
+                f"Created Enilive move {move_id} OdA={oda_name} "
+                f"consume-POL={[p['po_line_id'] for p in consumed_pol_info]} "
+                f"new-POL-servizio={new_servizio_pol_id}")
+
+            # 4) Allego XML
+            if analysis.raw_xml:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito: {e}")
+
+            # 5) Marca fatturapa registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito: {e}")
+
+            if carte_non_mappate:
+                logger.warning(
+                    f"Enilive: {len(carte_non_mappate)} carte NON in mappa "
+                    f"(fallback uso_promiscuo): {carte_non_mappate}. "
+                    f"Aggiornare input/carte_enilive.xlsx.")
+
+            primary = consumed_pol_info[0]
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': p['classif']}
+                for p in consumed_pol_info[1:]
+            ]
+            added = [new_servizio_pol_id] if new_servizio_pol_id else None
+            return WriteResult(success=True, action='create_draft_enilive',
+                               move_id=move_id, dry_run=False,
+                               po_line_id=primary['po_line_id'],
+                               old_price_unit=primary['old_price_unit'],
+                               old_name=primary['old_name'],
+                               old_date_planned=primary['old_date_planned'],
+                               extra_po_lines=extras or None,
+                               added_po_line_ids=added)
+
+        except Exception as e:
+            logger.exception("Errore create_bozza_enilive")
+            # Rollback POL riassegnate
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'taxes_id': [(6, 0, p['old_taxes_id'])],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            # Rollback POL SERVIZIO creata
+            if new_servizio_pol_id:
+                try:
+                    self.client._call('purchase.order.line', 'unlink',
+                                       [new_servizio_pol_id])
+                except Exception:
+                    logger.warning(f"Unlink new POL {new_servizio_pol_id} fallito")
+            return WriteResult(success=False, action='create_draft_enilive',
+                               error_message=str(e), dry_run=False)
+
+    # ====================================================================
+    # === LEASYS ITALIA (IT06714021000) — POL aggregate + ad-hoc extra ===
+    # ====================================================================
+    #
+    # Schema deciso 13/05/2026 (vedi memoria project_session_2026_05_13_leasys_refactor):
+    #
+    # A) CANONI (CANONE LOCAZIONE / CANONE SERVIZIO):
+    #    - Aggregati per (cls × voce) → max 4 bucket
+    #    - Acquisti pre-pianifica 4 POL/mese su P03021 con name generico tipo
+    #      "MAGGIO 2026 canone locazione POOL" (synonimi: automezzi/furgoni)
+    #      "MAGGIO 2026 canone servizio USO PROMISCUO" (synonimi: uso promiscuo/autovetture)
+    #    - Per multi-fattura nello stesso mese Acquisti ripete i 4 nomi N volte
+    #    - Writer FIFO per id ascendente, riassegna POL: price=tot_bucket,
+    #      name=<vecchio name> ft.<numero fattura>, qty_received=1, tax 6,
+    #      account 430210/220/230/240, analytic ereditato
+    #
+    # B) VOCI EXTRA (tutto il resto: bolli/riaddebiti/penali/manutenzioni):
+    #    - Aggregate per (voce_extra × cls)
+    #    - Writer CREA POL ad-hoc completa (pattern Enilive FEE SICUREZZA)
+    #    - Routing:
+    #        tassa (IVA 0%) POOL          → 490300 (id 161), tax 47
+    #        tassa (IVA 0%) uso_promiscuo → 490410 (id 1129), tax 47
+    #        altro (IVA 22%) POOL         → 430230 (id 400), tax 6
+    #        altro (IVA 22%) uso_promiscuo→ 430240 (id 401), tax 6
+    #    - POL ad-hoc tracciate in added_po_line_ids per rollback
+
+    _LEASYS_CANONI_ROUTING = {
+        # (voce, cls) -> account_id move + tax_id
+        ('locazione', 'POOL'):          {'account_id':  398, 'tax_id': 6},
+        ('servizi',   'POOL'):          {'account_id':  400, 'tax_id': 6},
+        ('locazione', 'uso_promiscuo'): {'account_id':  399, 'tax_id': 6},
+        ('servizi',   'uso_promiscuo'): {'account_id':  401, 'tax_id': 6},
+        ('locazione', 'super_lusso'):   {'account_id': 1119, 'tax_id': 73},
+        ('servizi',   'super_lusso'):   {'account_id': 1120, 'tax_id': 73},
+    }
+
+    _LEASYS_EXTRA_ROUTING = {
+        # (voce_extra, cls) -> account_id, tax_id, label (per name POL)
+        ('tassa', 'POOL'):          {'account_id':  161, 'tax_id': 47,
+                                      'label': 'Riaddebito tassa POOL'},
+        ('tassa', 'uso_promiscuo'): {'account_id': 1129, 'tax_id': 47,
+                                      'label': 'Riaddebito tassa USO PROMISCUO'},
+        ('altro', 'POOL'):          {'account_id':  400, 'tax_id':  6,
+                                      'label': 'Altri servizi POOL'},
+        ('altro', 'uso_promiscuo'): {'account_id':  401, 'tax_id':  6,
+                                      'label': 'Altri servizi USO PROMISCUO'},
+    }
+
+    # Product Odoo "Fornitura di Servizi" (id 12202, uom 68 PZ) — coerente
+    # con le altre POL P03021 esistenti
+    _LEASYS_NEW_POL_PRODUCT_ID = 12202
+    _LEASYS_NEW_POL_PRODUCT_UOM_ID = 68
+
+    _RE_LEASYS_TARGA = re.compile(r'\b([A-Z]{2}\d{3}[A-Z]{2})\b')
+
+    _MESI_IT = ('', 'GENNAIO', 'FEBBRAIO', 'MARZO', 'APRILE', 'MAGGIO',
+                'GIUGNO', 'LUGLIO', 'AGOSTO', 'SETTEMBRE', 'OTTOBRE',
+                'NOVEMBRE', 'DICEMBRE')
+
+    @classmethod
+    def _mese_competenza_leasys(cls, righe, invoice_date_iso: str) -> Optional[str]:
+        """Deduce il nome del mese di competenza per una fattura Leasys.
+
+        Priorità:
+          1) DataInizioPeriodo della prima riga XML (FatturaPA standard).
+             Es: 2026-06-01 -> 'GIUGNO'
+          2) Fallback Leasys: mese fattura + 1 (canoni emessi al mese precedente)
+             Es: invoice_date 2026-05-08 -> mese 5+1=6 -> 'GIUGNO'
+
+        Ritorna None se impossibile dedurre (es. invoice_date malformato).
+        """
+        # 1) DataInizioPeriodo dalla prima riga utile
+        for r in righe or []:
+            dip = getattr(r, 'data_inizio_periodo', '') or ''
+            if dip and len(dip) >= 7:
+                try:
+                    mese = int(dip[5:7])
+                    if 1 <= mese <= 12:
+                        return cls._MESI_IT[mese]
+                except (ValueError, IndexError):
+                    continue
+        # 2) Fallback: mese fattura + 1
+        try:
+            y, m, _ = invoice_date_iso.split('-')
+            mese = (int(m) % 12) + 1
+            return cls._MESI_IT[mese]
+        except Exception:
+            return None
+
+    @classmethod
+    def _classify_voce_leasys(cls, descrizione: str, aliquota_iva: float) -> str:
+        """Classifica la voce di una riga XML Leasys.
+
+        - 'locazione' se desc contiene 'CANONE LOCAZIONE'
+        - 'servizi'   se desc contiene 'CANONE SERVIZIO' (singolare o plurale)
+        - 'tassa'     se aliquota_iva == 0 (riaddebito bollo/tasse)
+        - 'altro'     fallback (penali/manutenzioni/varie IVA 22%)
+        """
+        desc_u = (descrizione or '').upper()
+        if 'CANONE LOCAZIONE' in desc_u:
+            return 'locazione'
+        if 'CANONE SERVIZIO' in desc_u or 'CANONE SERVIZI' in desc_u:
+            return 'servizi'
+        if (aliquota_iva or 0) == 0:
+            return 'tassa'
+        return 'altro'
+
+    @classmethod
+    def _classify_cls_leasys(cls, targa: str, contratto: str = '') -> str:
+        """Lookup cls fiscale veicolo da targa/contratto via PARCO_AUTO.
+
+        Il PARCO_AUTO autogen usa la chiave 'classificazione' (senza suffisso
+        _fiscale). Manteniamo entrambe per compatibilità con eventuali estensioni
+        future.
+
+        Fallback conservativo: 'uso_promiscuo' (deducib. 70%) se non in mappa.
+        """
+        try:
+            from config.parco_auto_mapping import (
+                PARCO_BY_TARGA, PARCO_BY_CONTRATTO,
+            )
+        except ImportError:
+            return 'uso_promiscuo'
+        def _read_cls(info):
+            return (info.get('classificazione')
+                    or info.get('classificazione_fiscale'))
+        if targa:
+            info = PARCO_BY_TARGA.get(targa.upper())
+            if info:
+                v = _read_cls(info)
+                if v:
+                    return v
+        if contratto:
+            info = PARCO_BY_CONTRATTO.get(str(contratto).strip())
+            if info:
+                v = _read_cls(info)
+                if v:
+                    return v
+        return 'uso_promiscuo'
+
+    def _match_leasys_canone_pol(self, libere: List[Dict], voce: str, cls: str,
+                                   used_ids: set,
+                                   mese_competenza: Optional[str] = None) -> Optional[Dict]:
+        """Cerca una POL libera "canone" matchante (voce + cls + mese), FIFO id ASC.
+
+        Match in 3 livelli di priorità decrescente:
+          1) Esatto: voce + cls + mese_competenza nel name (es. 'GIUGNO 2026 canone locazione POOL')
+          2) voce + cls (qualsiasi mese) — fallback se mese specifico esaurito
+          3) Solo voce (cls dedotta dal name, qualsiasi mese)
+
+        Le `libere` sono già ordinate per (price_unit, id) da
+        _find_libere_purchase_order_lines, ma re-sortiamo per id ASC qui per il
+        pattern multi-fattura con name uguali (coppie A/B).
+        """
+        libere_sorted = sorted([l for l in libere if l['id'] not in used_ids],
+                                key=lambda l: l['id'])
+        # Livello 1: voce + cls + mese
+        if mese_competenza:
+            for cand in libere_sorted:
+                name = cand.get('name') or ''
+                if mese_competenza not in name.upper():
+                    continue
+                if not self._pol_name_matches_voce(cand, voce):
+                    continue
+                if self._classify_cls_from_pol_name(name) == cls:
+                    return cand
+        # Livello 2: voce + cls (qualsiasi mese)
+        for cand in libere_sorted:
+            name = cand.get('name') or ''
+            if not self._pol_name_matches_voce(cand, voce):
+                continue
+            if self._classify_cls_from_pol_name(name) == cls:
+                return cand
+        # Livello 3: solo voce (cls inferita dal name)
+        for cand in libere_sorted:
+            if self._pol_name_matches_voce(cand, voce):
+                return cand
+        return None
+
+    def _create_bozza_leasys_aggregated(self, analysis,
+                                          mapping_entry: Dict) -> WriteResult:
+        """Crea bozza Leasys con pattern aggregato (4 POL canoni + N POL extra).
+
+        Steps:
+          1) Aggrega righe XML per (cls × voce_canone) e (cls × voce_extra)
+          2) Per ogni bucket canone: match POL pre-pianificata su P03021, riassegna
+          3) Per ogni bucket extra: crea POL ad-hoc (account/tax/analytic/product)
+          4) Crea account.move con N move_line (una per bucket non vuoto)
+          5) DRY-RUN o scrittura reale + rollback su errore
+
+        action='create_draft_automezzi' (compatibile con audit DB esistente).
+        """
+        if not analysis.xml_data:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc not in ('TD01', 'TD04'):
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=f"Tipo {tipo_doc} non supportato (atteso TD01/TD04)",
+                               dry_run=self.dry_run)
+        is_nota_credito = (tipo_doc == 'TD04')
+
+        righe = analysis.xml_data.righe or []
+        if not righe:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="Nessuna riga in XML",
+                               dry_run=self.dry_run)
+
+        nome_forn = mapping_entry.get('nome', 'Leasys Italia S.p.A.')
+        oda_name = mapping_entry.get('oda_fisso', 'P03021')
+
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        date_contabile = self._data_contabile(analysis, invoice_date)
+        date_iva = self._end_of_month(invoice_date)
+
+        # Mese competenza (da DataInizioPeriodo della prima riga o fallback
+        # mese fattura +1) -> filtro POL solo del mese giusto, evita di
+        # consumare per errore POL di mesi successivi durante FIFO.
+        mese_competenza = self._mese_competenza_leasys(righe, invoice_date)
+
+        # === Fase 1: aggregazione righe per (voce, cls) ===
+        # Buckets canoni: voce ∈ {locazione, servizi} → match POL pre-pianificate
+        # Buckets extra: voce ∈ {tassa, altro} → POL ad-hoc create dal writer
+        bucket_canoni = {}  # (voce, cls) -> {imp, iva, n_righe, targhe}
+        bucket_extra  = {}  # (voce, cls) -> {imp, iva, n_righe, targhe, desc_sample}
+        targhe_unmapped = set()
+
+        for r in righe:
+            desc = r.descrizione or ''
+            voce = self._classify_voce_leasys(desc, r.aliquota_iva or 0)
+            m = self._RE_LEASYS_TARGA.search(desc.upper())
+            targa = m.group(1) if m else None
+            cls = self._classify_cls_leasys(targa)
+            if targa and cls == 'uso_promiscuo':
+                # Verifica se era davvero default (per warning, no impatto cls)
+                try:
+                    from config.parco_auto_mapping import PARCO_BY_TARGA
+                    if targa not in PARCO_BY_TARGA:
+                        targhe_unmapped.add(targa)
+                except ImportError:
+                    pass
+
+            prezzo = float(r.prezzo_totale or 0)
+            iva_amt = prezzo * (r.aliquota_iva or 0) / 100
+            key = (voce, cls)
+            target_bucket = bucket_canoni if voce in ('locazione', 'servizi') else bucket_extra
+            if key not in target_bucket:
+                target_bucket[key] = {
+                    'imp': 0.0, 'iva': 0.0, 'n_righe': 0,
+                    'targhe': set(), 'desc_sample': desc[:80],
+                }
+            target_bucket[key]['imp'] += prezzo
+            target_bucket[key]['iva'] += iva_amt
+            target_bucket[key]['n_righe'] += 1
+            if targa:
+                target_bucket[key]['targhe'].add(targa)
+
+        if not bucket_canoni and not bucket_extra:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message="Nessuna riga aggregabile",
+                               dry_run=self.dry_run)
+
+        # === Fase 2: trovo OdA P03021 + POL libere ===
+        ECOTEL = 1
+        pos = self.client._call('purchase.order', 'search_read',
+            [('name', '=', oda_name), ('company_id', '=', ECOTEL)],
+            fields=['id', 'name', 'state', 'partner_id', 'currency_id'],
+            limit=1)
+        if not pos:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=f"OdA {oda_name} non trovato su Ecotel",
+                               dry_run=self.dry_run)
+        po = pos[0]
+        po_id = po['id']
+        partner_id = (po['partner_id'][0]
+                       if isinstance(po['partner_id'], list) else None)
+        currency_id = (po['currency_id'][0]
+                        if isinstance(po['currency_id'], list) else None)
+        if not partner_id:
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=f"OdA {oda_name} senza partner",
+                               dry_run=self.dry_run)
+
+        libere = self._find_libere_purchase_order_lines(po_id, 'standard_qty_inv_rec')
+
+        # Recupero analytic_account_id ereditato da una POL del PO (4225 S03869)
+        srv_analytic_id = None
+        if libere:
+            _aa = libere[0].get('account_analytic_id')
+            srv_analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+        if not srv_analytic_id:
+            any_pols = self.client._call('purchase.order.line', 'search_read',
+                [('order_id', '=', po_id)],
+                fields=['account_analytic_id'], limit=1)
+            if any_pols:
+                _aa = any_pols[0].get('account_analytic_id')
+                srv_analytic_id = _aa[0] if isinstance(_aa, list) else _aa
+
+        # === Fase 3: match POL pre-pianificate per bucket canoni ===
+        consumed_pol_info = []  # POL riassegnate
+        move_lines_vals = []
+        used_pol_ids: set = set()
+
+        # Ordine fisso per stabilità output
+        ORDER_VOCI = ['locazione', 'servizi']
+        ORDER_CLS  = ['POOL', 'uso_promiscuo', 'super_lusso']
+        for cls in ORDER_CLS:
+            for voce in ORDER_VOCI:
+                if (voce, cls) not in bucket_canoni:
+                    continue
+                bk = bucket_canoni[(voce, cls)]
+                pol = self._match_leasys_canone_pol(libere, voce, cls,
+                                                      used_pol_ids,
+                                                      mese_competenza=mese_competenza)
+                if pol is None:
+                    mese_hint = (f" (mese competenza {mese_competenza})"
+                                  if mese_competenza else "")
+                    return WriteResult(success=False, action='create_draft_automezzi',
+                                       error_message=(
+                                           f"Nessuna POL canone libera su {oda_name} "
+                                           f"per ({voce}, {cls}){mese_hint}. Acquisti deve pre-pianificare "
+                                           f"una POL '<{mese_competenza or 'MESE'}> canone {voce} "
+                                           f"{cls.upper().replace('_',' ')}'."),
+                                       dry_run=self.dry_run)
+                used_pol_ids.add(pol['id'])
+
+                routing = self._LEASYS_CANONI_ROUTING.get((voce, cls))
+                if not routing:
+                    return WriteResult(success=False, action='create_draft_automezzi',
+                                       error_message=f"Routing canone non definito per ({voce}, {cls})",
+                                       dry_run=self.dry_run)
+
+                # Name post-consumo: append ft.NUMERO al name esistente
+                old_name = pol.get('name') or ''
+                new_name = old_name
+                if invoice_number and f'ft.{invoice_number}' not in new_name:
+                    new_name = f"{old_name} ft.{invoice_number}"
+
+                # Segno per NC TD04: nel writer Leasys i canoni hanno sempre price +,
+                # eccetto NC dove price_unit va negativo (convenzione Ecotel TD04)
+                price = round(bk['imp'], 2)
+                if is_nota_credito:
+                    price = -abs(price)
+
+                _prod = pol.get('product_id')
+                product_id = _prod[0] if isinstance(_prod, list) else _prod
+                _uom = pol.get('product_uom')
+                product_uom_id = _uom[0] if isinstance(_uom, list) else _uom
+                _aa = pol.get('account_analytic_id')
+                analytic_id = (_aa[0] if isinstance(_aa, list) else _aa) or srv_analytic_id
+
+                consumed_pol_info.append({
+                    'po_line_id': pol['id'],
+                    'oda_name': oda_name,
+                    'voce': voce, 'cls': cls,
+                    'old_price_unit': pol.get('price_unit') or 0,
+                    'old_name': old_name,
+                    'old_date_planned': pol.get('date_planned') or None,
+                    'old_taxes_id': list(pol.get('taxes_id') or []),
+                    'new_price': price,
+                    'new_name': new_name,
+                    'new_tax_id': routing['tax_id'],
+                    'account_id': routing['account_id'],
+                    'product_id': product_id,
+                    'product_uom_id': product_uom_id,
+                    'analytic_account_id': analytic_id,
+                    'n_righe_aggregate': bk['n_righe'],
+                    'n_targhe_distinte': len(bk['targhe']),
+                })
+
+                qty_signed = -1 if is_nota_credito else 1
+                ml_vals = {
+                    'name': new_name,
+                    'account_id': routing['account_id'],
+                    'price_unit': price,
+                    'quantity': qty_signed,
+                    'tax_ids': [(6, 0, [routing['tax_id']])],
+                    'purchase_line_id': pol['id'],
+                }
+                if product_id:
+                    ml_vals['product_id'] = product_id
+                if product_uom_id:
+                    ml_vals['product_uom_id'] = product_uom_id
+                if analytic_id:
+                    ml_vals['analytic_account_id'] = analytic_id
+                move_lines_vals.append(ml_vals)
+
+        # === Fase 4: POL ad-hoc per bucket extra ===
+        new_pol_info_list = []   # [{order_id, name, ...}, ...] per scrittura
+        ORDER_EXTRA_VOCI = ['tassa', 'altro']
+        for cls in ORDER_CLS:
+            for voce in ORDER_EXTRA_VOCI:
+                if (voce, cls) not in bucket_extra:
+                    continue
+                bk = bucket_extra[(voce, cls)]
+                routing = self._LEASYS_EXTRA_ROUTING.get((voce, cls))
+                if not routing:
+                    return WriteResult(success=False, action='create_draft_automezzi',
+                                       error_message=f"Routing extra non definito per ({voce}, {cls})",
+                                       dry_run=self.dry_run)
+                imp = round(bk['imp'], 2)
+                if is_nota_credito:
+                    imp = -abs(imp)
+                pol_name = f"{routing['label']} ft.{invoice_number}"
+                new_pol_info_list.append({
+                    'order_id': po_id,
+                    'name': pol_name,
+                    'product_id': self._LEASYS_NEW_POL_PRODUCT_ID,
+                    'product_uom': self._LEASYS_NEW_POL_PRODUCT_UOM_ID,
+                    'product_qty': 1,
+                    'price_unit': imp,
+                    'taxes_id': [(6, 0, [routing['tax_id']])],
+                    'date_planned': invoice_date,
+                    'account_analytic_id': srv_analytic_id,
+                    # info per move_line costruita dopo create POL
+                    '_voce': voce, '_cls': cls, '_imp': imp,
+                    '_account_id': routing['account_id'],
+                    '_tax_id': routing['tax_id'],
+                })
+
+        # === Fase 5: build move_vals_base ===
+        move_type = 'in_refund' if is_nota_credito else 'in_invoice'
+        move_vals_base = {
+            'move_type': move_type,
+            'partner_id': partner_id,
+            'invoice_date': invoice_date,
+            'date': date_contabile,
+            'l10n_it_vat_settlement_date': date_iva,
+            'ref': invoice_number,
+            'invoice_origin': oda_name,
+            'journal_id': mapping_entry.get('journal_id', 2),
+            'company_id': ECOTEL,
+            'currency_id': currency_id,
+        }
+
+        # === DRY-RUN ===
+        if self.dry_run:
+            tot_canoni = sum(p['new_price'] for p in consumed_pol_info)
+            tot_extra = sum(p['_imp'] for p in new_pol_info_list)
+            consumed_str = '; '.join(
+                f"POL {p['po_line_id']} ({p['voce']}/{p['cls']}) "
+                f"EUR{p['old_price_unit']:.2f}->EUR{p['new_price']:.2f} acc{p['account_id']}"
+                for p in consumed_pol_info)
+            extras_str = '; '.join(
+                f"NEW POL ({p['_voce']}/{p['_cls']}) EUR{p['_imp']:.2f} "
+                f"acc{p['_account_id']} tax{p['_tax_id']}"
+                for p in new_pol_info_list)
+            logger.info(
+                f"[DRY_RUN] _create_bozza_leasys_aggregated fornitore={nome_forn} "
+                f"OdA={oda_name} doc={invoice_number} type={tipo_doc} "
+                f"canoni_buckets={len(consumed_pol_info)} (tot={tot_canoni:.2f}) "
+                f"extra_buckets={len(new_pol_info_list)} (tot={tot_extra:.2f}) "
+                f"consume-POL=[{consumed_str}] extras=[{extras_str}]")
+            if targhe_unmapped:
+                logger.warning(
+                    f"[DRY_RUN] Leasys: {len(targhe_unmapped)} targhe NON in PARCO "
+                    f"(fallback uso_promiscuo): {sorted(targhe_unmapped)[:10]}")
+            primary = consumed_pol_info[0] if consumed_pol_info else None
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': f"{p['voce']}/{p['cls']}"}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(
+                success=True, action='create_draft_automezzi',
+                move_id=None, dry_run=True,
+                po_line_id=primary['po_line_id'] if primary else None,
+                old_price_unit=primary['old_price_unit'] if primary else None,
+                old_name=primary['old_name'] if primary else None,
+                old_date_planned=primary['old_date_planned'] if primary else None,
+                extra_po_lines=extras or None,
+                # in dry-run le POL nuove non vengono create -> None
+            )
+
+        # === SCRITTURA REALE ===
+        new_pol_ids_created = []
+        try:
+            # 1) Riassegno POL canoni
+            for p in consumed_pol_info:
+                qty_signed_pol = -1 if is_nota_credito else 1
+                self.client._call('purchase.order.line', 'write',
+                    [p['po_line_id']], {
+                        'price_unit': p['new_price'],
+                        'name': p['new_name'],
+                        'taxes_id': [(6, 0, [p['new_tax_id']])],
+                        'product_qty': 1,
+                        'qty_received': qty_signed_pol,
+                        'qty_received_manual': qty_signed_pol,
+                        'date_planned': invoice_date,
+                    })
+                logger.info(
+                    f"Leasys: updated POL {p['po_line_id']} ({p['voce']}/{p['cls']}) "
+                    f"price={p['new_price']:.2f} acc={p['account_id']} tax={p['new_tax_id']}")
+
+            # 2) Creo POL extra ad-hoc
+            for info in new_pol_info_list:
+                qty_signed_pol = -1 if is_nota_credito else 1
+                new_pol_vals = {
+                    'order_id': info['order_id'],
+                    'name': info['name'],
+                    'product_id': info['product_id'],
+                    'product_uom': info['product_uom'],
+                    'product_qty': info['product_qty'],
+                    'price_unit': info['price_unit'],
+                    'taxes_id': info['taxes_id'],
+                    'date_planned': info['date_planned'],
+                    'qty_received': qty_signed_pol,
+                    'qty_received_manual': qty_signed_pol,
+                }
+                if info.get('account_analytic_id'):
+                    new_pol_vals['account_analytic_id'] = info['account_analytic_id']
+                new_pol_id = self.client._call('purchase.order.line', 'create',
+                                                 new_pol_vals)
+                if isinstance(new_pol_id, list):
+                    new_pol_id = new_pol_id[0] if new_pol_id else None
+                if not new_pol_id:
+                    raise RuntimeError(f"create POL extra returned empty for {info['_voce']}/{info['_cls']}")
+                new_pol_ids_created.append(new_pol_id)
+                logger.info(
+                    f"Leasys: created NEW POL {new_pol_id} ({info['_voce']}/{info['_cls']}) "
+                    f"price={info['price_unit']:.2f} acc={info['_account_id']} tax={info['_tax_id']}")
+
+                # Move_line collegata
+                ml_vals = {
+                    'name': info['name'],
+                    'account_id': info['_account_id'],
+                    'price_unit': info['price_unit'],
+                    'quantity': qty_signed_pol,
+                    'tax_ids': info['taxes_id'],
+                    'purchase_line_id': new_pol_id,
+                    'product_id': info['product_id'],
+                    'product_uom_id': info['product_uom'],
+                }
+                if info.get('account_analytic_id'):
+                    ml_vals['analytic_account_id'] = info['account_analytic_id']
+                move_lines_vals.append(ml_vals)
+
+            # 3) Creo il move
+            move_vals = dict(move_vals_base)
+            move_vals['invoice_line_ids'] = [(0, 0, ml) for ml in move_lines_vals]
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            if not move_id:
+                raise RuntimeError("create move returned empty")
+            logger.info(
+                f"Created Leasys move {move_id} OdA={oda_name} doc={invoice_number} "
+                f"consume-POL={[p['po_line_id'] for p in consumed_pol_info]} "
+                f"new-POL={new_pol_ids_created}")
+
+            # 4) Allego XML
+            if analysis.raw_xml:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito: {e}")
+
+            # 5) Marca fatturapa registered
+            if analysis.attachment_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                except Exception as e:
+                    logger.warning(f"Collegamento fatturapa fallito: {e}")
+
+            if targhe_unmapped:
+                logger.warning(
+                    f"Leasys: {len(targhe_unmapped)} targhe NON in PARCO "
+                    f"(fallback uso_promiscuo): {sorted(targhe_unmapped)[:10]}. "
+                    f"Aggiornare input/Parco Auto.xlsx.")
+
+            primary = consumed_pol_info[0] if consumed_pol_info else None
+            extras = [
+                {'po_line_id': p['po_line_id'],
+                 'old_price_unit': p['old_price_unit'],
+                 'old_name': p['old_name'],
+                 'old_date_planned': p['old_date_planned'],
+                 'old_taxes_id': p['old_taxes_id'],
+                 'cls': f"{p['voce']}/{p['cls']}"}
+                for p in consumed_pol_info[1:]
+            ]
+            return WriteResult(
+                success=True, action='create_draft_automezzi',
+                move_id=move_id, dry_run=False,
+                po_line_id=primary['po_line_id'] if primary else None,
+                old_price_unit=primary['old_price_unit'] if primary else None,
+                old_name=primary['old_name'] if primary else None,
+                old_date_planned=primary['old_date_planned'] if primary else None,
+                extra_po_lines=extras or None,
+                added_po_line_ids=new_pol_ids_created or None,
+            )
+
+        except Exception as e:
+            logger.exception("Errore _create_bozza_leasys_aggregated")
+            # Rollback POL canoni riassegnate
+            for p in consumed_pol_info:
+                try:
+                    self.client._call('purchase.order.line', 'write',
+                        [p['po_line_id']], {
+                            'price_unit': p['old_price_unit'],
+                            'name': p['old_name'],
+                            'taxes_id': [(6, 0, p['old_taxes_id'])],
+                            'qty_received': 0,
+                            'qty_received_manual': 0,
+                        })
+                except Exception:
+                    logger.warning(f"Restore POL {p['po_line_id']} fallito")
+            # Rollback POL extra create
+            for pol_id in new_pol_ids_created:
+                try:
+                    self.client._call('purchase.order.line', 'unlink', [pol_id])
+                except Exception:
+                    logger.warning(f"Unlink new POL {pol_id} fallito")
+            return WriteResult(success=False, action='create_draft_automezzi',
+                               error_message=str(e), dry_run=False)

@@ -74,6 +74,18 @@ class FatturaPALine:
     # Dict tipo (uppercase) -> RiferimentoTesto. Usato dal writer Automezzi
     # come fonte alternativa per targa/numero contratto.
     altri_dati_gestionali: Dict[str, str] = field(default_factory=dict)
+    # <RiferimentoAmministrazione> a livello di riga.
+    # Per Edenred UTA Mobility (carte carburante): contiene il numero carta
+    # UTA (~17 cifre, es. '63620050421481915') usato per lookup veicolo+classe
+    # fiscale via config/carte_carburante_mapping.py.
+    riferimento_amministrazione: str = ""
+    # Periodo di competenza della prestazione (FatturaPA standard).
+    # Leasys/altri noleggi: la fattura viene emessa il mese precedente, ma
+    # i canoni si riferiscono al mese successivo (es. fattura 08/05/2026
+    # con DataInizioPeriodo=2026-06-01 -> competenza giugno).
+    # Formato ISO 'YYYY-MM-DD' (stessa convenzione del campo `data` fattura).
+    data_inizio_periodo: str = ""
+    data_fine_periodo: str = ""
 
 
 @dataclass
@@ -392,6 +404,21 @@ def parse_fatturapa_xml(xml_content: str) -> FatturaPAData:
                 line.prezzo_unitario = _safe_float(_get_text(linea, 'PrezzoUnitario'))
                 line.prezzo_totale = _safe_float(_get_text(linea, 'PrezzoTotale'))
                 line.aliquota_iva = _safe_float(_get_text(linea, 'AliquotaIVA'))
+                # <RiferimentoAmministrazione> a livello di riga: Edenred UTA
+                # lo usa come numero carta carburante (~17 cifre).
+                line.riferimento_amministrazione = (
+                    _get_text(linea, 'RiferimentoAmministrazione') or ''
+                ).strip()
+                # <DataInizioPeriodo> / <DataFinePeriodo> per fatture canoni
+                # noleggio (Leasys/Athlon/Arval/etc.): competenza del canone.
+                # Quando presente, il mese di competenza viene usato dal writer
+                # per matchare la POL pre-pianificata del mese giusto.
+                line.data_inizio_periodo = (
+                    _get_text(linea, 'DataInizioPeriodo') or ''
+                ).strip()
+                line.data_fine_periodo = (
+                    _get_text(linea, 'DataFinePeriodo') or ''
+                ).strip()
 
                 # FatturaPA permette N nodi <CodiceArticolo> per riga
                 # (es. Tecnoalt: ARTICOLO + TARGA + ID-GV3 + MATRICOLA).

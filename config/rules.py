@@ -442,6 +442,44 @@ MAPPATURA_FORNITORI_FISSI = {
         'description_strategy': 'nwg_periodo',
         'auto_write_enabled': True,
     },
+    # WE4SERVICES Società Consortile a r.l.: OdA-ledger annuale P03696 con 4
+    # righe placeholder per ogni mese (2× "Oneri Factoring" tax [54] esente +
+    # 2× "FEE Maturata" tax [11] 22%). Le fatture NON citano mai l'OdA in XML
+    # e gli importi sono variabili.
+    # Routing fatture XML -> POL libera:
+    #   1. mese di competenza = mese italiano della data fattura (es. 2026-05-08 -> "Maggio")
+    #   2. tipo riga = keyword "Oneri Factoring" o "FEE" sulla descrizione XML
+    # Le 2 POL gemelle per mese vengono consumate in ordine (FIFO sull'id POL).
+    # Se entrambe sono già usate e arriva una 3ª fattura dello stesso tipo,
+    # il writer ritorna errore e la fattura resta DA_VERIFICARE.
+    # Storico (13 fatture posted gen-apr 2026): conto 525040 (id=1095), journal 2.
+    # Chiave = P.IVA cedente da XML (IdPaese+IdCodice CedentePrestatore /
+    # DatiAnagrafici), allineata con res.partner.vat su Odoo (id=585).
+    # Il CodiceFiscale del CedentePrestatore (IT01641790702) è invece distinto.
+    'IT14861711001': {
+        'nome': 'WE4SERVICES Società Consortile a r.l.',
+        'oda_fisso': 'P03696',
+        'conto_contabile': '525040',
+        'conto_descrizione': 'Commissioni WE4SERVICE',
+        'partner_id': 585,
+        'conto_contabile_id': 1095,
+        'taxes_id': [11],                # default (FEE); il writer usa tax POL libera
+        'journal_id': 2,
+        'company_id': 1,
+        'libere_criterio': 'standard_qty_inv_rec',
+        # Strategia descrizione: mantiene il nome originale della POL libera
+        # (es. "Oneri Factoring // Addebito Oneri Factoring Maggio") e appende
+        # il numero fattura XML come riferimento ("... (rif.ft 70/01)").
+        'description_strategy': 'keep_original_with_ref',
+        'auto_write_enabled': True,
+        # Nuova chiave: routing 2D (tipo + mese da data fattura). Il writer
+        # multilinea cercherà 1 POL libera per ogni gruppo applicabile, con
+        # AND fra keyword tipo e mese italiano della data fattura.
+        'line_groups_by_month': [
+            {'match': 'Oneri Factoring'},
+            {'match': 'FEE'},
+        ],
+    },
     # SOCRATE SRLS: consulenze commerciali, 6 fatture posted negli ultimi 6 mesi
     # tutte da €18.300 esatti su P03366 (€128.100 ledger annuale, 9 righe da
     # €15.000 imponibile + IVA, una per mese). Storico conto: 420540 (4/6).
@@ -560,6 +598,48 @@ MAPPATURA_FORNITORI_FISSI = {
                 'cc_type': 'ecotel_main',
             },
         },
+    },
+    # EDENRED UTA MOBILITY S.R.L. — carte carburante (~€200k/anno, 2 ft/mese)
+    # XML: ~114 righe di rifornimenti singoli con <RiferimentoAmministrazione>
+    # = numero carta UTA. Ogni riga -> 1 carta -> 1 veicolo -> classificazione
+    # fiscale (POOL/uso_promiscuo/super_lusso). Aggregato in 3-4 voci semantiche
+    # nel writer (clone pattern Athlon/Leasys).
+    # Mappa carte in config/carte_carburante_mapping.py (rigenerata da
+    # scripts/generate_carte_carburante_mapping.py a partire da
+    # input/carte_uta.xlsx).
+    # POL pre-pianificate da Acquisti su P03735 con name semantico
+    # ("Costo carburante ft.n. XXX\n{classe}") -> keep_pol_name=True.
+    'IT01696270212': {
+        'nome': 'Edenred UTA Mobility S.r.l.',
+        'partner_id': 1835,
+        'oda_fisso': 'P03735',
+        'multi_contratto': False,
+        'description_strategy': 'edenred_uta',
+        'keep_pol_name': True,
+        'auto_write_enabled': False,   # cautela iniziale, da accendere dopo 1-2 fatture OK
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    # ENILIVE S.P.A. — carte carburante (~€200k/anno, 1 ft/mese ca.)
+    # XML: 5 righe AGGREGATE per prodotto (BENZSP/DIESEL/ADBLUE/FEE), NO
+    # <RiferimentoAmministrazione>. Il dettaglio carta-per-carta è SOLO nel
+    # PDF allegato. Lo parsa core/enilive_pdf_parser.py, classifica via
+    # config/carte_enilive_mapping.py (input/carte_enilive.xlsx, auto-refresh
+    # su mtime), e il writer create_bozza_enilive aggrega in max 3 voci
+    # (POOL/uso_promiscuo/super_lusso) + 1 SERVIZIO (POL creata ad-hoc per la
+    # FEE SICUREZZA E GEST, product_id 12202 "Fornitura di Servizi").
+    # POL pre-pianificate quindicinali da Acquisti su P03731 con keyword
+    # "AUTOMEZZI"/"AUTOVETTURE" e range "dal X al Y" -> match per periodo.
+    'IT11403240960': {
+        'nome': 'Enilive S.p.A.',
+        'partner_id': 1908,
+        'oda_fisso': 'P03731',
+        'multi_contratto': False,
+        'description_strategy': 'enilive_carte',
+        'keep_pol_name': False,         # il writer riscrive il name della POL
+        'auto_write_enabled': False,    # cautela iniziale, test reale prima
+        'journal_id': 2,
+        'company_id': 1,
     },
 }
 

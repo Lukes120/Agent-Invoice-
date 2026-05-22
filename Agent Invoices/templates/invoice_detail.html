@@ -39,7 +39,7 @@
   </div>
 </div>
 
-{% if a['classification'] in ('MAPPATURA_FORNITORE_FISSO', 'MAPPATURA_AUTOMEZZI', 'AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA', 'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK', 'DA_VERIFICARE', 'CUMULATIVO_ECCEDE') %}
+{% if a['classification'] in ('MAPPATURA_FORNITORE_FISSO', 'MAPPATURA_AUTOMEZZI', 'AUTO_VALIDABILE', 'MATCH_IMPLICITO', 'MATCH_DA_SUGGERIMENTO', 'MATCH_DA_SUGGERIMENTO_PIU_EXTRA', 'MATCH_PARZIALE_OK', 'PARZIALE_CUMULATIVO_OK', 'DA_VERIFICARE', 'CUMULATIVO_ECCEDE', 'NO_ODA_DA_CLASSIFICARE') %}
 <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-5 mb-6">
   {% if a['classification'] == 'MAPPATURA_AUTOMEZZI' %}
   <h2 class="font-semibold mb-3 text-emerald-800">Scrittura Odoo (Automezzi 🚗)</h2>
@@ -247,6 +247,78 @@
 </div>
 {% endif %}
 
+{# === Sezione dedicata Edenred UTA Mobility — carte carburante (IT01696270212) === #}
+{% if a['supplier_vat'] == 'IT01696270212' %}
+<div class="bg-amber-50 border border-amber-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-amber-900">
+    ⛽ Edenred UTA Mobility — carte carburante (consume-POL su P03735)
+  </h2>
+  <p class="text-sm text-amber-800 mb-3">
+    Le fatture Edenred UTA contengono ~114 righe di rifornimenti singoli con
+    <code>&lt;RiferimentoAmministrazione&gt;</code> = numero carta UTA. L&apos;agent
+    aggrega le righe per classificazione fiscale del veicolo (mappata in
+    <code>input/carte_uta.xlsx</code>) e produce max 4 voci move_line.
+    <br/>Routing contabile per classe:
+    <b>POOL</b> (furgoni 100%) → 410300 + IVA 22% S,
+    <b>uso_promiscuo</b> (autovetture 70%) → 410410 + IVA 22% S,
+    <b>super_lusso</b> (amministratore 20%) → 410400 + IVA 22% indetraibile 60%,
+    <b>SERVIZIO</b> (fee/lavaggio) → 420190 + IVA 22% S.
+  </p>
+
+  <div class="bg-white rounded p-3 border border-amber-200">
+    <h3 class="font-semibold text-sm mb-2 text-amber-900">Crea bozza Edenred UTA</h3>
+    <p class="text-xs text-amber-800 mb-2">
+      Crea <code>account.move</code> con max 4 righe (1 per classificazione),
+      ognuna collegata a una POL libera di P03735 via <code>purchase_line_id</code>.
+      Le POL vengono riscritte col pattern storico
+      "Costo carburante ft.n. XXX\n{classe}".
+    </p>
+    <button id="btn-draft-edenred-uta" onclick="createDraftEdenredUta({{ a['id'] }})"
+            class="px-4 py-2 bg-amber-700 text-white rounded hover:bg-amber-800 text-sm">
+      ⛽ Crea bozza Edenred UTA
+    </button>
+    <div id="edenred-uta-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
+
+{# === Sezione dedicata Enilive S.p.A. — carte carburante (IT11403240960) === #}
+{% if a['supplier_vat'] == 'IT11403240960' %}
+<div class="bg-amber-50 border border-amber-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-amber-900">
+    ⛽ Enilive S.p.A. — carte carburante (consume-POL su P03731 + nuova POL servizio)
+  </h2>
+  <p class="text-sm text-amber-800 mb-3">
+    L&apos;XML FatturaPA Enilive contiene solo righe aggregate per prodotto
+    (BENZSP/DIESEL/ADBLUE/FEE) — il dettaglio carta-per-carta è
+    <b>solo nel PDF allegato</b>. L&apos;agent parsa il PDF
+    (<code>core/enilive_pdf_parser.py</code>), classifica le carte da
+    <code>input/carte_enilive.xlsx</code> (auto-refresh su mtime), e aggrega
+    in max 3 voci POOL/uso_promiscuo/super_lusso + 1 voce SERVIZIO per
+    l&apos;eventuale FEE SICUREZZA E GEST.
+    <br/>Routing contabile per classe:
+    <b>POOL</b> (furgoni/AUTOMEZZI 100%) → 410300 + IVA 22% S,
+    <b>uso_promiscuo</b> (AUTOVETTURE 70%) → 410410 + IVA 22% S,
+    <b>super_lusso</b> (amministratore 20%) → 410400 + IVA 22% indetraibile 60%,
+    <b>SERVIZIO</b> (FEE SICUREZZA) → <b>POL CREATA ad-hoc</b> + 420190 + IVA 22% S.
+  </p>
+
+  <div class="bg-white rounded p-3 border border-amber-200">
+    <h3 class="font-semibold text-sm mb-2 text-amber-900">Crea bozza Enilive</h3>
+    <p class="text-xs text-amber-800 mb-2">
+      Match POL libere su P03731 per <b>keyword + periodo</b>: AUTOMEZZI/AUTOVETTURE
+      con range "dal X al Y" che contiene la data fattura. La POL SERVIZIO
+      (se serve) viene creata con product <i>"Fornitura di Servizi"</i> (id 12202).
+    </p>
+    <button id="btn-draft-enilive" onclick="createDraftEnilive({{ a['id'] }})"
+            class="px-4 py-2 bg-amber-700 text-white rounded hover:bg-amber-800 text-sm">
+      ⛽ Crea bozza Enilive
+    </button>
+    <div id="enilive-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
+
 {# === Sezione dedicata Telepass canoni (IT09771701001) === #}
 {% if a['supplier_vat'] == 'IT09771701001' %}
 <div class="bg-sky-50 border border-sky-300 rounded-lg p-5 mb-6">
@@ -310,7 +382,8 @@ async function refreshStatus(analysisId) {
       // Mostra/nascondi pulsanti — accetto tutte le action di creazione bozza
       const CREATE_ACTIONS = ['create_draft', 'create_draft_from_oda',
         'create_draft_libera', 'create_draft_autostrade',
-        'create_draft_telepass_canoni', 'create_draft_automezzi'];
+        'create_draft_telepass_canoni', 'create_draft_automezzi',
+        'create_draft_edenred_uta', 'create_draft_enilive'];
       const lastCreate = data.writes.find(w =>
         CREATE_ACTIONS.includes(w.action) && w.success && !w.dry_run);
       const lastRollback = data.writes.find(w =>
@@ -472,6 +545,68 @@ async function createDraftAutomezzi(analysisId) {
   } finally {
     btn.disabled = false;
     btn.textContent = '🚗 Crea bozza Automezzi';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
+
+// === Edenred UTA — dedicated handler ===
+{% if a['supplier_vat'] == 'IT01696270212' %}
+async function createDraftEdenredUta(analysisId) {
+  const btn = document.getElementById('btn-draft-edenred-uta');
+  const statusDiv = document.getElementById('edenred-uta-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-amber-700">Invio richiesta...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_edenred_uta/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? ' <b>[DRY_RUN]</b>' : '';
+      const mid = data.move_id ? ` move_id=<b>${data.move_id}</b>` : '';
+      statusDiv.innerHTML = `<span class="text-emerald-700">✓ Bozza creata${dr}${mid}</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error || 'Errore'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⛽ Crea bozza Edenred UTA';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
+
+// === Enilive — dedicated handler ===
+{% if a['supplier_vat'] == 'IT11403240960' %}
+async function createDraftEnilive(analysisId) {
+  const btn = document.getElementById('btn-draft-enilive');
+  const statusDiv = document.getElementById('enilive-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-amber-700">Invio richiesta...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_enilive/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? ' <b>[DRY_RUN]</b>' : '';
+      const mid = data.move_id ? ` move_id=<b>${data.move_id}</b>` : '';
+      const added = data.added_po_line_ids && data.added_po_line_ids.length
+                     ? ` (POL servizio creata: ${data.added_po_line_ids.join(',')})` : '';
+      statusDiv.innerHTML = `<span class="text-emerald-700">✓ Bozza creata${dr}${mid}${added}</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error || 'Errore'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⛽ Crea bozza Enilive';
     refreshStatus(analysisId);
   }
 }

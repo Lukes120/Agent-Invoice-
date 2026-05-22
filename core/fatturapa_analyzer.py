@@ -406,6 +406,47 @@ class FatturaPAAnalyzer:
         # dell'imponibile totale, usando le righe solo per riconoscere
         # le spese accessorie (keyword) ed escluderle dal confronto.
 
+        # FIX A (RAJAPACK pattern): se una riga keyword è già coperta da una POL
+        # accessoria dell'OdA con stesso importo (es. POL "spese" 13,50 €), NON
+        # va trattata come extra — riclassifico a EXACT prima del calcolo
+        # keyword_amount, così la fattura cade in AUTO_VALIDABILE.
+        po_lines_for_cover = getattr(analysis, 'po_lines', None) or []
+        if po_lines_for_cover:
+            accessory_kws = ('spes', 'trasport', 'spedizion', 'bollo', 'bolli',
+                             'oneri', 'imballag', 'noleg')
+            keyword_lms = [lm for lm in line_matches if lm.match_type == "KEYWORD"]
+            covering_pols = [pol for pol in po_lines_for_cover
+                             if float(pol.get('qty_invoiced') or 0) <= 0.001
+                             and any(k in (pol.get('name') or '').lower()
+                                     for k in accessory_kws)]
+            used_pol_ids = set()
+            cover_map = []  # [(LineMatch, pol_dict)] da riclassificare
+            for lm in keyword_lms:
+                kw_amount = float(lm.invoice_line.get('price_subtotal') or 0)
+                if kw_amount <= 0:
+                    continue
+                for pol in covering_pols:
+                    if pol['id'] in used_pol_ids:
+                        continue
+                    if abs(float(pol.get('price_subtotal') or 0) - kw_amount) < 0.01:
+                        cover_map.append((lm, pol))
+                        used_pol_ids.add(pol['id'])
+                        break
+            # Riclassifico solo se TUTTE le keyword sono coperte 1-a-1 da POL OdA
+            if cover_map and len(cover_map) == len(keyword_lms):
+                for lm, pol in cover_map:
+                    lm.match_type = "EXACT"
+                    lm.po_line = pol
+                    lm.keyword_category = None
+                    lm.keyword_account = None
+                    lm.notes.append(
+                        f"Coperta da POL OdA '{(pol.get('name') or '')[:40]}' "
+                        f"(€{float(pol.get('price_subtotal') or 0):.2f}) — "
+                        f"non trattata come extra"
+                    )
+                keyword_count = 0
+                exact_count += len(cover_map)
+
         # Somma delle righe classificate come keyword (trasporto, bolli...)
         # queste sono "extra" che in genere non sono nell'OdA
         keyword_amount = sum(
@@ -640,12 +681,17 @@ class FatturaPAAnalyzer:
         mappatura esplicita).
 
         Riusa _find_subset_match per cercare un sottoinsieme di righe libere
-        OdA che sommi inv_untaxed entro la tolleranza stretta.
+        OdA che sommi (inv_untaxed - keyword_amount) entro la tolleranza
+        stretta. Le righe XML keyword-classified (TRASPORTO/ONERI_BANCARI/
+        BOLLO) vengono escluse dal target perche' tipicamente NON sono
+        modellate sull'OdA: vengono invece girate al writer come
+        partial_extra_lines, cosi' _add_extra_pol_to_oda le aggiungera'
+        come POL extra accessorie.
 
         Si attiva SOLO se:
         - analysis.purchase_order popolato e analysis.po_lines disponibili
-        - inv_untaxed < po_untaxed (fattura piu' piccola)
-        - le righe XML non hanno trovato match (no_match dominante)
+        - target (merci nette) > 0 e <= po_untaxed
+        - esistono POL libere
 
         Ritorna True se ha promosso a MATCH_PARZIALE_OK; False se nessun
         match valido (caller continuera' col fallback DA_VERIFICARE).
@@ -653,11 +699,18 @@ class FatturaPAAnalyzer:
         po_lines = getattr(analysis, 'po_lines', None) or []
         if not po_lines:
             return False
-        if inv_untaxed <= 0 or po_untaxed <= inv_untaxed:
-            return False
 
-        # Tolleranza stretta (riusa la costante del match parziale)
+        # P1: scorporo le righe accessorie (keyword) dal target subset.
+        # Le accessorie verranno appese come POL extra al momento della bozza.
+        keyword_amount = sum(
+            float(lm.invoice_line.get('price_subtotal', 0))
+            for lm in analysis.line_matches if lm.match_type == "KEYWORD"
+        )
+        target = inv_untaxed - keyword_amount
+
         tol = self.partial_match_tolerance_absolute
+        if target <= 0 or po_untaxed < target - tol:
+            return False
 
         # Conta righe "libere" disponibili (qty_invoiced=0). Se non ce ne sono,
         # niente da fare (caso "tutto gia' fatturato": e' un vero DA_VERIFICARE).
@@ -670,7 +723,7 @@ class FatturaPAAnalyzer:
 
         # _find_subset_match restituisce un dict {count, type, desc, line_ids,
         # extra_amount} se il subset e' trovato. Riusa la primitiva esistente.
-        match_info = self._find_subset_match(libere, inv_untaxed, tol,
+        match_info = self._find_subset_match(libere, target, tol,
                                              secondary_tolerance=0.0)
         if not match_info:
             return False
@@ -686,10 +739,24 @@ class FatturaPAAnalyzer:
         # Salvo i line_ids selezionati per uso del writer
         analysis.partial_match_subset_lines = line_ids
 
+        # P1: se ci sono righe accessorie, popolo partial_extra_lines per il
+        # writer (_add_extra_pol_to_oda gia' in produzione).
+        kw_count = sum(1 for lm in analysis.line_matches if lm.match_type == "KEYWORD")
+        if keyword_amount > 0 and kw_count > 0:
+            analysis.partial_extra_lines = self._build_extra_lines_from_keyword_matches(analysis)
+            analysis.partial_extra_total = keyword_amount
+            analysis.partial_match_applied = True
+            extra_msg = (
+                f" + {kw_count} riga/e accessoria/e €{keyword_amount:.2f} "
+                f"(aggiunte come POL extra)"
+            )
+        else:
+            extra_msg = ""
+
         analysis.actions_suggested = [
             f"OdA-ledger: la fattura consuma {match_info['count']} riga/righe "
             f"libere su {n_libere_tot} dell'OdA {po_name} "
-            f"(imponibile fattura €{inv_untaxed:.2f} = somma righe selezionate). "
+            f"(merci €{target:.2f} = somma righe selezionate{extra_msg}). "
             f"Righe: {match_info.get('desc','')}. "
             f"Registrare collegando alle righe selezionate."
         ]
@@ -1411,6 +1478,31 @@ class FatturaPAAnalyzer:
                 if abs(s - target) <= tolerance:
                     return _build_match(combo, k, type_name, None, extra=0.0)
 
+        # PRIMA PASSATA — FASE 4b: ricerca per COMPLEMENTO.
+        # Se target e' vicino al totale items, cercare un subset di righe da
+        # ESCLUDERE e' equivalente a cercare il subset da includere ma con
+        # combinatoria molto piu' bassa. Sblocca casi tipo CONRAD: 8 POL
+        # totali, fattura consuma 6/8, complemento = 2 POL non consumate.
+        total_sum_items = sum(a for _, a, _ in items)
+        remainder = total_sum_items - target
+        if (remainder > tolerance
+                and len(items) >= 6
+                and len(items) <= 40):
+            # Cerco un subset di righe la cui somma = remainder (= righe non
+            # consumate dalla fattura). k massimo: meta' items, max 4.
+            max_k = min(4, len(items) // 2)
+            for k_excl in range(1, max_k + 1):
+                for excluded in combinations(items, k_excl):
+                    s_excl = sum(a for _, a, _ in excluded)
+                    if abs(s_excl - remainder) <= tolerance:
+                        excluded_ids = {c[0] for c in excluded}
+                        included = [it for it in items if it[0] not in excluded_ids]
+                        if included:
+                            return _build_match(
+                                included, len(included),
+                                f'complement_excl_{k_excl}', None, extra=0.0
+                            )
+
         # PRIMA PASSATA — FASE 5: somma TOTALE di tutte le righe libere
         # (caso "fattura conclusiva" che chiude tutte le righe libere dell'OdA)
         if len(items) > 4:
@@ -1722,6 +1814,49 @@ class FatturaPAAnalyzer:
             # Usiamo la stessa tolleranza percentuale del matcher regolare
             diff_percent = (diff / po_untaxed * 100) if po_untaxed > 0 else 0
             if diff <= self.tol_total and diff_percent <= self.matcher.tol_percent:
+                continue
+
+            # P4: prima di marcare CUMULATIVO_ECCEDE, verifico se l'eccesso e'
+            # spiegato dalle righe accessorie (keyword TRASPORTO/ONERI_BANCARI/
+            # BOLLO) delle fatture del gruppo. Se si' -> declasso TUTTE a
+            # PARZIALE_CUMULATIVO_OK e popolo partial_extra_lines per ognuna,
+            # cosi' al momento della bozza il writer creera' le POL extra
+            # accessorie sull'OdA (pattern Sonepar/Coel).
+            extras_cumul = 0.0
+            per_invoice_extras: Dict[int, float] = {}
+            for a in group:
+                a_kw = sum(
+                    float(lm.invoice_line.get('price_subtotal', 0))
+                    for lm in a.line_matches if lm.match_type == "KEYWORD"
+                )
+                per_invoice_extras[id(a)] = a_kw
+                extras_cumul += a_kw
+            diff_netto = diff - extras_cumul
+            diff_netto_percent = (diff_netto / po_untaxed * 100) if po_untaxed > 0 else 0
+
+            if (extras_cumul > 0
+                    and diff_netto <= self.tol_total
+                    and diff_netto_percent <= self.matcher.tol_percent):
+                # Eccesso interamente spiegato dalle accessorie.
+                for a in group:
+                    a_kw = per_invoice_extras.get(id(a), 0.0)
+                    a_kw_count = sum(
+                        1 for lm in a.line_matches if lm.match_type == "KEYWORD"
+                    )
+                    if a_kw > 0 and a_kw_count > 0:
+                        a.partial_extra_lines = (
+                            self._build_extra_lines_from_keyword_matches(a)
+                        )
+                        a.partial_extra_total = a_kw
+                        a.partial_match_applied = True
+                    a.classification = "PARZIALE_CUMULATIVO_OK"
+                    a.actions_suggested = [
+                        f"OdA-ledger cumulativo: {len(group)} fatture della run "
+                        f"consumano l'OdA {po_name} (€{po_untaxed:.2f}). "
+                        f"Merci cumulate €{grand_total - extras_cumul:.2f}, "
+                        f"accessorie €{extras_cumul:.2f} (verranno aggiunte come "
+                        f"POL extra). Registrare."
+                    ]
                 continue
 
             # SFORA: avviso tutte le fatture del gruppo
