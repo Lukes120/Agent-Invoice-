@@ -76,3 +76,19 @@ desktop.ini
 '
 "0"
 0
+
+# =====================================================
+# Fatture e dati di input (PDF/XML/XLSX) — escluse totalmente
+# Contengono dati fornitori reali, P.IVA, importi: NON pushare su github.
+# =====================================================
+input/
+
+# =====================================================
+# Deploy e backup locali
+# Cartelle che NON devono finire su github.
+# =====================================================
+deploy/
+deploy_server/
+_backup_*/
+webapp_LEGACY_NON_USARE/
+pdf_inbox/
