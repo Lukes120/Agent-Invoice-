@@ -557,7 +557,20 @@ def invoice_detail(analysis_id):
     conn.close()
     if not a:
         abort(404)
-    return render_template('invoice_detail.html', a=a)
+    # Flag factoring: il fornitore (SARDA/MBFACTA) usa il writer dedicato
+    # create_bozza_factoring (box dedicato), NON il pulsante standard
+    # MAPPATURA_FORNITORE_FISSO (che cercherebbe righe libere inesistenti).
+    is_factoring = False
+    try:
+        from config.rules import MAPPATURA_FORNITORI_FISSI
+        vat = (a['supplier_vat'] or '').strip()
+        me = MAPPATURA_FORNITORI_FISSI.get(vat)
+        if not me and vat.startswith('IT'):
+            me = MAPPATURA_FORNITORI_FISSI.get(vat[2:])
+        is_factoring = bool(me and me.get('factoring'))
+    except Exception:
+        is_factoring = False
+    return render_template('invoice_detail.html', a=a, is_factoring=is_factoring)
 
 
 @app.route('/history')
@@ -1257,6 +1270,67 @@ def api_odoo_draft_edenred_uta(analysis_id):
             result.old_price_unit, result.old_name, result.old_date_planned,
             result.error_message, 1 if result.dry_run else 0,
             extra_pol_json,
+        ))
+        conn.commit()
+        return jsonify(result.to_dict()), (200 if result.success else 500)
+    finally:
+        conn.close()
+
+
+@app.route('/api/odoo_write/draft_factoring/<int:analysis_id>', methods=['POST'])
+def api_odoo_draft_factoring(analysis_id):
+    """Crea bozza per fattura di factoring (SARDA FACTORING / MBFACTA).
+
+    Routing per P.IVA con flag 'factoring' in MAPPATURA_FORNITORI_FISSI.
+    Il writer create_bozza_factoring CREA POL nuove sull'OdA-ledger (P03522
+    per SARDA) — l'OdA non ha righe libere pre-create — raggruppando le righe
+    XML per natura IVA: esente N4 (taxes_esente) + eventuale bollo N1 art.15
+    (taxes_bollo). Le POL create sono tracciate in added_po_line_ids per il
+    rollback (unlink).
+    """
+    from core.odoo_writer import OdooWriter
+    from config.rules import MAPPATURA_FORNITORI_FISSI, ODOO_WRITE_DRY_RUN
+
+    conn = get_db()
+    try:
+        analysis, client = _load_analysis_for_write(conn, analysis_id)
+        if not analysis:
+            return jsonify({'success': False, 'error': 'Analisi non trovata'}), 404
+        if not client:
+            return jsonify({'success': False,
+                            'error': 'Impossibile connettersi a Odoo'}), 500
+        if not analysis.xml_data:
+            return jsonify({'success': False,
+                            'error': 'Analisi senza xml_data'}), 400
+        cedente_vat = (analysis.xml_data.cedente_partita_iva or '').strip()
+        mapping_entry = MAPPATURA_FORNITORI_FISSI.get(cedente_vat)
+        if not mapping_entry and cedente_vat.startswith('IT'):
+            mapping_entry = MAPPATURA_FORNITORI_FISSI.get(cedente_vat[2:])
+        if not mapping_entry or not mapping_entry.get('factoring'):
+            return jsonify({'success': False,
+                            'error': f"P.IVA {cedente_vat} non è un fornitore "
+                                     f"factoring mappato"}), 400
+
+        writer = OdooWriter(client, dry_run=ODOO_WRITE_DRY_RUN)
+        result = writer.create_bozza_factoring(analysis, mapping_entry)
+
+        # Log su odoo_writes: POL create tracciate in added_po_line_ids per
+        # il rollback (unlink delle POL nuove).
+        added_pol_csv = (','.join(str(x) for x in result.added_po_line_ids)
+                          if result.added_po_line_ids else None)
+        conn.execute("""
+            INSERT INTO odoo_writes
+            (analysis_id, timestamp, action, success, move_id, po_line_id,
+             old_price_unit, old_name, old_date_planned,
+             error_message, dry_run, added_po_line_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_id, datetime.now().isoformat(),
+            result.action, 1 if result.success else 0,
+            result.move_id, result.po_line_id,
+            result.old_price_unit, result.old_name, result.old_date_planned,
+            result.error_message, 1 if result.dry_run else 0,
+            added_pol_csv,
         ))
         conn.commit()
         return jsonify(result.to_dict()), (200 if result.success else 500)

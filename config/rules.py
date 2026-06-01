@@ -373,6 +373,26 @@ MAPPATURA_FORNITORI_FISSI = {
                 'oda_fisso': 'P04544',
                 'taxes_id': [11],
             },
+            # Censiti 26/05/2026 (verifica su Odoo da fattura registrata + storico origin).
+            # 065914207 = contratto "ombrello" sede Roma Via Fiume Bianco 56: Telecom ci emette
+            # fatture eterogenee (linea fissa, canoni). La contabilità le registra su P04107
+            # (OdA Licenze MS 2026, righe libere €2.288) con conto 420310 + IVA 22%. Verificato
+            # su fattura registrata 8W00207208 → ACQ/2026/2111.
+            '065914207': {
+                'oda_fisso': 'P04107',
+                'taxes_id': [11],
+            },
+            # 093413049178 = Licenze Microsoft CSP, sede Roma. Va su P04956 (secondo OdA Licenze
+            # MS 2026, righe libere mensili €800), confermato da utente.
+            '093413049178': {
+                'oda_fisso': 'P04956',
+                'taxes_id': [11],
+            },
+            # NB pending NON mappati (registrazione manuale per ora, decisione 26/05):
+            # - 0761356089 / 0761356106 (Viterbo) e 888012709459 (Carsoli) → calderone P03750,
+            #   che NON ha righe libere (la contabilità crea una POL per fattura) ed è OdA 2025
+            #   pieno: serve pattern "crea POL" + sostituto 2026 da Acquisti.
+            # - 093413005566 (GCP €663) → una-tantum, nessuno storico.
         },
     },
     # Wind Tre: multi-contratto. Il routing al contratto avviene tramite
@@ -638,6 +658,32 @@ MAPPATURA_FORNITORI_FISSI = {
         'description_strategy': 'enilive_carte',
         'keep_pol_name': False,         # il writer riscrive il name della POL
         'auto_write_enabled': False,    # cautela iniziale, test reale prima
+        'journal_id': 2,
+        'company_id': 1,
+    },
+    # SARDA FACTORING S.P.A. — factoring (commissioni/interessi/spese).
+    # Censito 26/05/2026 da analisi Odoo. Caratteristiche peculiari:
+    #  - Nessun OdA citato in XML, nessuna riga libera su P03522: la contabilità
+    #    CREA una nuova POL per ogni voce (pattern "crea POL", come Enilive).
+    #  - Tutte le righe IVA 0%: esenti N4 (tax 54) tranne il bollo "RECUPERO
+    #    IMPOSTA DI BOLLO" che è N1 art.15 (tax 47).
+    #  - Conto unico 525020 (id 226), prodotto 12301, analytic 4177 (S03811).
+    # Il writer dedicato create_bozza_factoring raggruppa le righe XML per IVA:
+    # max 1 POL esente (somma) + 1 POL bollo (somma), descrizione = concatenazione
+    # ' - ' delle descrizioni XML del gruppo. Solo TD01 (NC inesistenti → manuali).
+    # Routing per P.IVA (flag 'factoring': True), endpoint /draft_factoring.
+    'IT01681580922': {
+        'nome': 'SARDA FACTORING S.P.A.',
+        'partner_id': 51407,
+        'oda_fisso': 'P03522',
+        'multi_contratto': False,
+        'factoring': True,                 # flag dispatch writer factoring
+        'conto_contabile_id': 226,         # 525020 Commissioni SARDA FACTORING
+        'product_id': 12301,               # COMMISSIONI FACTORING E INTERESSI
+        'analytic_account_id': 4177,       # S03811 - Ecotel
+        'taxes_esente': [54],              # N4 esenti (default righe)
+        'taxes_bollo': [47],               # N1 escluse ex art.15 (righe "BOLLO")
+        'auto_write_enabled': False,       # cautela iniziale, test reale prima
         'journal_id': 2,
         'company_id': 1,
     },

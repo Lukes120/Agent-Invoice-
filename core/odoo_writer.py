@@ -6492,3 +6492,234 @@ class OdooWriter:
                     logger.warning(f"Unlink new POL {pol_id} fallito")
             return WriteResult(success=False, action='create_draft_automezzi',
                                error_message=str(e), dry_run=False)
+
+    # === Factoring: SARDA FACTORING / MBFACTA === #
+
+    def create_bozza_factoring(self, analysis, mapping_entry: Dict) -> WriteResult:
+        """
+        Per fornitori factoring (flag 'factoring' in MAPPATURA_FORNITORI_FISSI).
+
+        Peculiarità (vs gli altri writer fornitore-fisso):
+        - L'OdA-ledger (es. P03522) NON ha righe libere pre-create: la contabilità
+          aggiunge una nuova POL per ogni voce. Qui CREIAMO le POL (no consumo).
+        - Le righe XML sono tutte IVA 0%, ma con natura diversa: esenti N4
+          (taxes_esente, default) tranne il bollo "RECUPERO IMPOSTA DI BOLLO"
+          che è N1 art.15 (taxes_bollo). Distinzione per keyword 'BOLLO'.
+        - Conto unico (conto_contabile_id), prodotto e analytic fissi da mapping.
+
+        Strategia: raggruppa le righe XML per IVA → max 2 POL nuove su OdA
+        (1 esente con somma, 1 bollo con somma). Descrizione di ciascuna POL =
+        concatenazione ' - ' delle descrizioni XML del gruppo. move in_invoice.
+        Solo TD01/TD24/TD25 (NC inesistenti per questi fornitori → manuali).
+        Ritorna added_po_line_ids per il rollback (unlink delle POL create).
+        """
+        # Validazione mappatura factoring (campi diversi dal fornitore fisso std)
+        required = ['oda_fisso', 'partner_id', 'conto_contabile_id', 'product_id',
+                    'analytic_account_id', 'taxes_esente', 'journal_id', 'company_id']
+        for k in required:
+            if k not in mapping_entry or mapping_entry[k] is None:
+                return WriteResult(success=False, action='create_draft_factoring',
+                                   error_message=f"Mappatura factoring incompleta: "
+                                                 f"campo '{k}' mancante",
+                                   dry_run=self.dry_run)
+
+        if not analysis.xml_data:
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message="Analysis senza xml_data",
+                               dry_run=self.dry_run)
+
+        tipo_doc = analysis.xml_data.tipo_documento or ''
+        if tipo_doc not in ('TD01', 'TD24', 'TD25'):
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message=f"Tipo documento {tipo_doc} non supportato "
+                                            f"per factoring (solo TD01; le NC vanno "
+                                            f"registrate manualmente)",
+                               dry_run=self.dry_run)
+
+        # Recupero OdA-ledger
+        oda_name = mapping_entry['oda_fisso']
+        po = self.client.search_purchase_order_by_name(oda_name)
+        if not po:
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message=f"OdA {oda_name} non trovato",
+                               dry_run=self.dry_run)
+        if po.get('state') != 'purchase':
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message=f"OdA {oda_name} non in stato 'purchase' "
+                                            f"(è '{po.get('state')}')",
+                               dry_run=self.dry_run)
+        po_id = po['id']
+
+        # Raggruppo le righe XML per natura IVA (bollo vs esente)
+        righe = analysis.xml_data.righe or []
+        if not righe:
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message="Fattura factoring senza righe",
+                               dry_run=self.dry_run)
+
+        taxes_esente = mapping_entry['taxes_esente']
+        taxes_bollo = mapping_entry.get('taxes_bollo', [47])
+        esente_lines, bollo_lines = [], []
+        for r in righe:
+            if 'BOLLO' in (r.descrizione or '').upper():
+                bollo_lines.append(r)
+            else:
+                esente_lines.append(r)
+
+        def _group_spec(glines, taxes_id):
+            amount = round(sum(float(r.prezzo_totale or 0) for r in glines), 2)
+            descr = " - ".join(
+                r.descrizione.strip() for r in glines
+                if (r.descrizione or '').strip()
+            ) or 'Commissioni factoring'
+            return {'taxes_id': taxes_id, 'amount': amount, 'descr': descr}
+
+        pol_specs = []
+        if esente_lines:
+            pol_specs.append(_group_spec(esente_lines, taxes_esente))
+        if bollo_lines:
+            pol_specs.append(_group_spec(bollo_lines, taxes_bollo))
+
+        # Quadratura: somma POL vs imponibile XML (factoring esente: imp == totale)
+        total_imponibile = round(sum(p['amount'] for p in pol_specs), 2)
+        imponibile_xml = round(float(analysis.xml_data.imponibile_totale or 0), 2)
+        if abs(total_imponibile - imponibile_xml) > 0.02:
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message=f"Discrepanza imponibile: somma righe "
+                                            f"€{total_imponibile} vs XML €{imponibile_xml}. "
+                                            f"Verificare parsing righe.",
+                               dry_run=self.dry_run)
+
+        invoice_date = analysis.xml_data.data or ''
+        invoice_number = analysis.xml_data.numero or ''
+        conto_id = mapping_entry['conto_contabile_id']
+        product_id = mapping_entry['product_id']
+        analytic_id = mapping_entry['analytic_account_id']
+        product_uom = 1  # Units (prod 12301 ha uom_id=1)
+
+        # === DRY RUN ===
+        if self.dry_run:
+            logger.info(
+                f"[DRY_RUN] create_bozza_factoring {oda_name} "
+                f"({mapping_entry.get('nome')}): {len(pol_specs)} POL da creare → "
+                + "; ".join(
+                    f"'{p['descr'][:45]}' €{p['amount']:.2f} tax{p['taxes_id']}"
+                    for p in pol_specs)
+                + f" | move in_invoice ref={invoice_number} "
+                  f"tot imponibile €{total_imponibile:.2f}"
+            )
+            return WriteResult(success=True, action='create_draft_factoring',
+                               move_id=None, dry_run=True)
+
+        # === SCRITTURA REALE ===
+        created_pol_ids = []
+        try:
+            move_lines_vals = []
+            for p in pol_specs:
+                pol_vals = {
+                    'order_id': po_id,
+                    'name': p['descr'],
+                    'product_id': product_id,
+                    'product_uom': product_uom,
+                    'product_qty': 1,
+                    'price_unit': p['amount'],
+                    'qty_received': 1,
+                    'qty_received_manual': 1,
+                    'taxes_id': [(6, 0, p['taxes_id'])],
+                    'date_planned': invoice_date,
+                    'account_analytic_id': analytic_id,
+                }
+                new_pol_id = self.client._call('purchase.order.line', 'create',
+                                               pol_vals)
+                if isinstance(new_pol_id, list):
+                    new_pol_id = new_pol_id[0] if new_pol_id else None
+                if not new_pol_id:
+                    raise RuntimeError("create POL factoring returned empty")
+                created_pol_ids.append(new_pol_id)
+                logger.info(f"Factoring: created POL {new_pol_id} on {oda_name} "
+                           f"price={p['amount']:.2f} tax={p['taxes_id']} "
+                           f"desc='{p['descr'][:50]}'")
+
+                move_lines_vals.append({
+                    'name': p['descr'],
+                    'quantity': 1,
+                    'price_unit': p['amount'],
+                    'account_id': conto_id,
+                    'tax_ids': [(6, 0, p['taxes_id'])],
+                    'purchase_line_id': new_pol_id,
+                    'product_id': product_id,
+                    'product_uom_id': product_uom,
+                    'analytic_account_id': analytic_id,
+                })
+
+            payment_term_id = self._get_partner_payment_term(
+                mapping_entry['partner_id'])
+            data_contabile = self._data_contabile(analysis, invoice_date)
+            data_competenza_iva = self._end_of_month(invoice_date)
+
+            move_vals = {
+                'partner_id': mapping_entry['partner_id'],
+                'move_type': 'in_invoice',
+                'invoice_date': invoice_date,
+                'date': data_contabile,
+                'l10n_it_vat_settlement_date': data_competenza_iva,
+                'ref': invoice_number,
+                'invoice_origin': oda_name,
+                'journal_id': mapping_entry['journal_id'],
+                'company_id': mapping_entry['company_id'],
+                'invoice_line_ids': [(0, 0, ml) for ml in move_lines_vals],
+            }
+            if payment_term_id:
+                move_vals['invoice_payment_term_id'] = payment_term_id
+
+            move_id = self.client._call('account.move', 'create', move_vals)
+            if isinstance(move_id, list):
+                move_id = move_id[0] if move_id else None
+            logger.info(f"Factoring: created account.move id={move_id} [in_invoice] "
+                       f"{len(move_lines_vals)} righe, tot €{total_imponibile:.2f}")
+
+            # Collego e registro l'attachment
+            if analysis.attachment_id and move_id:
+                try:
+                    self.client._call('account.move', 'write', [move_id], {
+                        'fatturapa_attachment_in_id': analysis.attachment_id,
+                    })
+                    self.client._call('fatturapa.attachment.in', 'write',
+                        [analysis.attachment_id], {'registered': True})
+                    logger.info(f"Collegato attachment {analysis.attachment_id} "
+                               f"al move {move_id} (registered=True)")
+                except Exception as e:
+                    logger.warning(f"Collegamento attachment fallito "
+                                  f"(non blocca): {e}")
+
+            # Allego XML
+            if analysis.raw_xml and move_id:
+                try:
+                    self.client._call('ir.attachment', 'create', {
+                        'name': f"{invoice_number}.xml",
+                        'datas': base64.b64encode(
+                            analysis.raw_xml.encode('utf-8')).decode('ascii'),
+                        'res_model': 'account.move',
+                        'res_id': move_id,
+                        'mimetype': 'application/xml',
+                    })
+                    logger.info(f"XML allegato a move {move_id}")
+                except Exception as e:
+                    logger.warning(f"Allegato XML fallito (non blocca): {e}")
+
+            return WriteResult(success=True, action='create_draft_factoring',
+                               move_id=move_id, po_line_id=None,
+                               added_po_line_ids=created_pol_ids or None,
+                               dry_run=False)
+
+        except Exception as e:
+            logger.exception("Errore create_bozza_factoring")
+            # Rollback: unlink delle POL appena create
+            for pol_id in created_pol_ids:
+                try:
+                    self.client._call('purchase.order.line', 'unlink', [pol_id])
+                    logger.info(f"Rollback: unlink POL factoring {pol_id}")
+                except Exception:
+                    logger.warning(f"Unlink POL factoring {pol_id} fallito")
+            return WriteResult(success=False, action='create_draft_factoring',
+                               error_message=str(e), dry_run=False)

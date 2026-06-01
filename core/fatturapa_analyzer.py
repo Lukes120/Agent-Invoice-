@@ -317,6 +317,19 @@ class FatturaPAAnalyzer:
             # rimane come fallback finale se nessuno dei tentativi successivi
             # ha esito.
 
+            # Sotto-caso PRIORITARIO: fornitore in mappatura fissa.
+            # La mappatura è la fonte più affidabile: se il fornitore è censito
+            # (es. factoring SARDA/MBFACTA, o utility che NON citano OdA in XML),
+            # applica OdA+conto fissi PRIMA di tentare trasporto/implicito/
+            # parziale/suggerimenti (pensati per fornitori NON mappati).
+            # Senza questo, una fattura SARDA con sole righe "SPESE BONIFICO"
+            # finiva in TRASPORTO_OK invece che MAPPATURA_FORNITORE_FISSO.
+            if self.supplier_mapping_enabled and self.supplier_mapping:
+                self._try_supplier_fixed_mapping(analysis)
+                if analysis.classification in ("MAPPATURA_FORNITORE_FISSO",
+                                                "MAPPATURA_AUTOMEZZI"):
+                    return
+
             # Sotto-caso: tutte le righe sono spese accessorie note
             if keyword_count > 0 and no_match_count == 0 and keyword_count == total_lines:
                 analysis.classification = "TRASPORTO_OK"
@@ -343,14 +356,7 @@ class FatturaPAAnalyzer:
                 if analysis.classification != "ANOMALIA":
                     return
 
-            # Sotto-caso: MAPPATURA FORNITORI FISSI - per fornitori con
-            # pattern certo (Trenitalia, Italo, Telecom) applica OdA + conto fissi.
-            # PRIMA dei suggerimenti: la mappatura è più affidabile.
-            if self.supplier_mapping_enabled and self.supplier_mapping:
-                self._try_supplier_fixed_mapping(analysis)
-                if analysis.classification in ("MAPPATURA_FORNITORE_FISSO",
-                                                "MAPPATURA_AUTOMEZZI"):
-                    return
+            # (Mappatura fornitori fissi già tentata in cima al CASO 1.)
 
             # Sotto-caso: SUGGERIMENTI - cerco OdA aperti del fornitore
             # con sottoinsiemi di righe che matchano l'imponibile fattura.

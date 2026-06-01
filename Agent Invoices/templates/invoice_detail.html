@@ -132,7 +132,7 @@
   <div id="odoo-write-status" class="text-sm mb-3"></div>
 
   <div class="flex gap-2 flex-wrap">
-    {% if a['classification'] != 'MAPPATURA_AUTOMEZZI' %}
+    {% if a['classification'] != 'MAPPATURA_AUTOMEZZI' and not is_factoring %}
     <button id="btn-create-draft" onclick="createDraft({{ a['id'] }}, '{{ a['classification'] }}')"
             class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 text-sm">
       Crea bozza in Odoo
@@ -319,6 +319,39 @@
 </div>
 {% endif %}
 
+{# === Sezione dedicata Factoring (SARDA FACTORING / MBFACTA) === #}
+{% if is_factoring %}
+<div class="bg-violet-50 border border-violet-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-violet-900">
+    🏦 Factoring — commissioni/interessi (crea-POL su OdA-ledger)
+  </h2>
+  <p class="text-sm text-violet-800 mb-3">
+    Le fatture di factoring (commissioni, interessi precalcolati, spese tenuta
+    conto/bonifico, bollo) non citano OdA nell&apos;XML e l&apos;OdA-ledger non
+    ha righe libere pre-create: l&apos;agent <b>crea</b> le POL sull&apos;OdA.
+    Le righe XML vengono raggruppate per natura IVA: <b>esenti N4</b> (tax 54) in
+    una POL e l&apos;eventuale <b>bollo</b> "RECUPERO IMPOSTA DI BOLLO"
+    (N1 escluse ex art.15, tax 47) in una POL separata. Conto, prodotto e conto
+    analitico sono fissi da mappatura. Solo TD01 (le NC vanno registrate a mano).
+  </p>
+
+  <div class="bg-white rounded p-3 border border-violet-200">
+    <h3 class="font-semibold text-sm mb-2 text-violet-900">Crea bozza Factoring</h3>
+    <p class="text-xs text-violet-800 mb-2">
+      Crea <code>account.move</code> (in_invoice) con max 2 righe (esente + bollo),
+      ognuna collegata a una <b>POL nuova</b> creata sull&apos;OdA-ledger via
+      <code>purchase_line_id</code>. Descrizione POL = concatenazione " - " delle
+      descrizioni XML del gruppo.
+    </p>
+    <button id="btn-draft-factoring" onclick="createDraftFactoring({{ a['id'] }})"
+            class="px-4 py-2 bg-violet-700 text-white rounded hover:bg-violet-800 text-sm">
+      🏦 Crea bozza Factoring
+    </button>
+    <div id="factoring-status" class="text-sm mt-2"></div>
+  </div>
+</div>
+{% endif %}
+
 {# === Sezione dedicata Telepass canoni (IT09771701001) === #}
 {% if a['supplier_vat'] == 'IT09771701001' %}
 <div class="bg-sky-50 border border-sky-300 rounded-lg p-5 mb-6">
@@ -383,7 +416,8 @@ async function refreshStatus(analysisId) {
       const CREATE_ACTIONS = ['create_draft', 'create_draft_from_oda',
         'create_draft_libera', 'create_draft_autostrade',
         'create_draft_telepass_canoni', 'create_draft_automezzi',
-        'create_draft_edenred_uta', 'create_draft_enilive'];
+        'create_draft_edenred_uta', 'create_draft_enilive',
+        'create_draft_factoring'];
       const lastCreate = data.writes.find(w =>
         CREATE_ACTIONS.includes(w.action) && w.success && !w.dry_run);
       const lastRollback = data.writes.find(w =>
@@ -607,6 +641,38 @@ async function createDraftEnilive(analysisId) {
   } finally {
     btn.disabled = false;
     btn.textContent = '⛽ Crea bozza Enilive';
+    refreshStatus(analysisId);
+  }
+}
+{% endif %}
+
+// === Factoring — dedicated handler (SARDA / MBFACTA) ===
+{% if is_factoring %}
+async function createDraftFactoring(analysisId) {
+  const btn = document.getElementById('btn-draft-factoring');
+  const statusDiv = document.getElementById('factoring-status');
+  btn.disabled = true;
+  btn.textContent = 'Creazione bozza...';
+  statusDiv.innerHTML = '<span class="text-violet-700">Invio richiesta...</span>';
+  try {
+    const r = await fetch(`/api/odoo_write/draft_factoring/${analysisId}`, {
+      method: 'POST'
+    });
+    const data = await r.json();
+    if (data.success) {
+      const dr = data.dry_run ? ' <b>[DRY_RUN]</b>' : '';
+      const mid = data.move_id ? ` move_id=<b>${data.move_id}</b>` : '';
+      const added = data.added_po_line_ids && data.added_po_line_ids.length
+                     ? ` (POL create: ${data.added_po_line_ids.join(',')})` : '';
+      statusDiv.innerHTML = `<span class="text-emerald-700">✓ Bozza creata${dr}${mid}${added}</span>`;
+    } else {
+      statusDiv.innerHTML = `<span class="text-red-600">✗ ${data.error || 'Errore'}</span>`;
+    }
+  } catch (e) {
+    statusDiv.innerHTML = `<span class="text-red-600">Errore rete: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🏦 Crea bozza Factoring';
     refreshStatus(analysisId);
   }
 }
