@@ -478,6 +478,41 @@ class FatturaPAAnalyzer:
                 keyword_count = 0
                 exact_count += len(cover_map)
 
+            # Estensione FIX A (N-a-1): le keyword non coperte 1-a-1 possono
+            # comunque essere gia' modellate dall'OdA come UNA riga "spese"
+            # cumulativa (es. Lyreco: fattura 'SUPPLEMENTO 5,00' + 'CONTRIBUTO
+            # 3,50' vs OdA "spese" 8,50). Se l'imponibile fattura combacia con
+            # l'imponibile OdA entro tolleranza (la fattura consuma l'INTERO
+            # ordine) E le POL accessorie OdA non fatturate coprono la somma
+            # delle keyword residue, allora NON sono extra: riclassifico a EXACT.
+            # Gate stretto su inv≈OdA: i pattern "accessoria davvero extra"
+            # (inv>OdA, RemaTarlazzi) e subset-ledger (inv<OdA, RWS) NON scattano.
+            if keyword_count > 0:
+                inv_unt = float(analysis.xml_data.imponibile_totale or 0)
+                po_unt = float(analysis.purchase_order.get('amount_untaxed', 0))
+                tol_full = max(0.5, abs(inv_unt) * 0.01)
+                residual_kw_lms = [lm for lm in keyword_lms
+                                   if lm.match_type == "KEYWORD"]
+                kw_residual_total = sum(
+                    float(lm.invoice_line.get('price_subtotal') or 0)
+                    for lm in residual_kw_lms)
+                accessory_pol_residual = sum(
+                    float(pol.get('price_subtotal') or 0)
+                    for pol in covering_pols if pol['id'] not in used_pol_ids)
+                if (residual_kw_lms
+                        and abs(inv_unt - po_unt) <= tol_full
+                        and accessory_pol_residual >= kw_residual_total - 0.01):
+                    for lm in residual_kw_lms:
+                        lm.match_type = "EXACT"
+                        lm.keyword_category = None
+                        lm.keyword_account = None
+                        lm.notes.append(
+                            f"Coperta (N-a-1) da POL accessorie OdA "
+                            f"(tot €{accessory_pol_residual:.2f}) — non extra"
+                        )
+                    exact_count += len(residual_kw_lms)
+                    keyword_count = 0
+
         # Somma delle righe classificate come keyword (trasporto, bolli...)
         # queste sono "extra" che in genere non sono nell'OdA
         keyword_amount = sum(
