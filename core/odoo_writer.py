@@ -2216,8 +2216,15 @@ class OdooWriter:
                 if is_nota_credito:
                     # Per le NC sottrai dalla ricevuta (storno parziale del servizio)
                     delta = -delta
-                old_rec_manual = float(pl.get('qty_received_manual') or 0)
-                new_rec_manual = old_rec_manual + delta
+                # Lego qty_received al CUMULATO fatturato (qty_invoiced corrente +
+                # delta di questa bozza) invece di sommare alla qty_received_manual
+                # preesistente. Evita il doppio conteggio quando la POL servizio ha
+                # gia' qty_received>0 impostata fuori dall'agent (es. Lyreco P04870
+                # "spese" con ord=1/ric=1/fat=0 → col vecchio old+delta diventava
+                # ric=2 > ordinato). Resta corretto per il pattern OdA-ledger:
+                # 2ª fattura qty_invoiced=1 + delta=1 = 2, identico a prima.
+                qty_inv_old = float(pl.get('qty_invoiced') or 0)
+                new_rec_manual = qty_inv_old + delta
                 try:
                     self.client._call('purchase.order.line', 'write',
                         [pl['id']], {
