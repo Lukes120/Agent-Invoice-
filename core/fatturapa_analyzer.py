@@ -358,6 +358,31 @@ class FatturaPAAnalyzer:
 
             # (Mappatura fornitori fissi già tentata in cima al CASO 1.)
 
+            # Sotto-caso NC-aware (TD04): una nota di credito senza OdA esplicito
+            # NON deve ricevere suggerimenti di OdA *aperti* (residuo > 0): quella
+            # è logica da fattura, fuorviante per una NC che storna merce GIA'
+            # fatturata. La marchiamo per verifica manuale (vedi fattura originale
+            # + OdA da stornare). Scope chirurgico: intercetta solo le NC che a
+            # questo punto cadrebbero in NO_ODA_CON_SUGGERIMENTI / NO_ODA_DA_
+            # CLASSIFICARE; le NC con OdA esplicito (CASO 3) o già agganciate da
+            # match implicito/parziale sono gestite prima e restano intatte.
+            tipo_doc = getattr(analysis.xml_data, 'tipo_documento', '') or ''
+            if tipo_doc.upper() == 'TD04':
+                analysis.classification = "NOTA_CREDITO_NO_ODA"
+                hint = ""
+                if analysis.oda_values_raw:
+                    hint = f" Valori grezzi nell'XML: {analysis.oda_values_raw}."
+                analysis.warnings.append(
+                    "Nota di credito (TD04) senza OdA esplicito in XML."
+                )
+                analysis.actions_suggested.append(
+                    f"Nota di credito senza riferimento OdA: verificare "
+                    f"manualmente la fattura originale e l'OdA da stornare. "
+                    f"NESSUN suggerimento automatico (gli OdA aperti non sono "
+                    f"pertinenti per una NC).{hint}"
+                )
+                return
+
             # Sotto-caso: SUGGERIMENTI - cerco OdA aperti del fornitore
             # con sottoinsiemi di righe che matchano l'imponibile fattura.
             # Se 1 SOLO OdA candidato -> MATCH_DA_SUGGERIMENTO (bozza creabile);

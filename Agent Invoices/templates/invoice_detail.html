@@ -31,6 +31,8 @@
       <span class="badge badge-purple">{{ cls }}</span>
     {% elif cls == 'NO_ODA_CON_SUGGERIMENTI' %}
       <span class="badge badge-blue">{{ cls }}</span>
+    {% elif cls == 'NOTA_CREDITO_NO_ODA' %}
+      <span class="badge badge-amber">{{ cls }}</span>
     {% elif cls == 'MAPPATURA_FORNITORE_FISSO' %}
       <span class="badge badge-green">{{ cls }}</span>
     {% else %}
@@ -160,6 +162,33 @@
 
   <div id="reception-status" class="hidden mt-3 p-3 bg-white rounded border border-emerald-200 text-sm"></div>
 </div>
+
+{# === Nota di credito senza OdA esplicito (TD04 -> NOTA_CREDITO_NO_ODA) === #}
+{% if a['classification'] == 'NOTA_CREDITO_NO_ODA' %}
+<div class="bg-amber-50 border border-amber-300 rounded-lg p-5 mb-6">
+  <h2 class="font-semibold mb-2 text-amber-900">
+    &#129534; Nota di credito senza OdA — verifica manuale
+  </h2>
+  <p class="text-sm text-amber-800 mb-3">
+    Questa è una <b>nota di credito (TD04)</b> che <b>non cita un OdA</b> nell'XML.
+    L'agent <b>non propone OdA automatici</b>: gli OdA aperti (residuo &gt; 0) non
+    sono pertinenti per una NC, che storna merce <b>già fatturata</b>. La
+    registrazione va fatta a mano collegandosi alla <b>fattura originale</b> e
+    all'<b>OdA da stornare</b> (importi/quantità negativi, prefisso "NC -").
+  </p>
+  <div class="bg-white rounded p-3 border border-amber-200 text-xs text-amber-900 mb-2">
+    Nota: spesso il fornitore lascia un <b>placeholder</b> nel campo OdA dell'XML
+    (es. ".") invece del numero d'ordine, quindi l'agent non può agganciare
+    automaticamente. Recuperare l'OdA dalla fattura originale stornata.
+  </div>
+  <div class="flex gap-2 flex-wrap">
+    <button onclick="refreshStatus({{ a['id'] }})"
+            class="px-4 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm">
+      Aggiorna stato
+    </button>
+  </div>
+</div>
+{% endif %}
 
 {# === Sezione dedicata Autostrade per l'Italia (IT07516911000) === #}
 {% if a['supplier_vat'] == 'IT07516911000' %}
