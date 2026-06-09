@@ -3,11 +3,16 @@ Report serale: fatture in fatturapa.attachment.in (registered=False) per le
 quali la merce NON e' stata ancora ricevuta al magazzino Ecotel.
 
 Logica:
-1. Carico tutti gli attachment registered=False di Ecotel (company_id=1, no
-   self_invoice) degli ultimi 90 giorni.
-2. Parso l'XML per estrarre numero/data/totale/cedente/oda_riferimenti.
-3. Per ogni OdA citato nell'XML (o dedotto da partner+importo), recupero le
-   purchase.order.line e verifico:
+1. Carico gli attachment registered=False di Ecotel (company_id=1, no
+   self_invoice) ricevuti via SdI da ALMENO 7 giorni (--min-age) e non oltre
+   90 giorni (--lookback). Cosi' segnalo solo le fatture per cui, trascorsi 7
+   giorni dalla ricezione, NON e' ancora stata fatta la ricezione merce.
+2. Eseguo la stessa pipeline di Agent Invoices/app.py (FatturaPAAnalyzer) per
+   classificare ogni fattura e risolvere l'OdA collegato. Gli OdA considerati
+   sono quelli citati esplicitamente nell'XML PIU' quelli risolti via
+   match implicito / match parziale (MATCH_RESOLVED_CLASSES). Gli *_AMBIGUO
+   restano esclusi (analyzer mette purchase_order=None).
+3. Per ogni OdA collegato recupero le purchase.order.line e verifico:
      - product.type IN ('product','consu')  -> riga MERCE
      - qty_received == 0                    -> NON ricevuta
 4. Tiro fuori SOLO le fatture che hanno almeno 1 riga merce con qty_received=0.
@@ -19,7 +24,8 @@ Schedulazione: Task Scheduler Windows giornaliero alle 19:30 sul server.
 Lanciabile a mano: `python scripts/report_merci_non_ricevute.py`
 Opzioni:
   --dry-run         non invia mail, stampa HTML su stdout
-  --lookback N      sovrascrive lookback default 90 giorni
+  --lookback N      lookback massimo su create_date (default 90 giorni)
+  --min-age N       eta minima dalla ricezione SdI (default 7 giorni)
   --output FILE     scrive HTML su file (per debug)
 """
 from __future__ import annotations
@@ -44,10 +50,32 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / 'config' / 'credentials.env')
 
 from core.odoo_client import OdooReadOnlyClient
-from core.fatturapa_parser import parse_from_base64
+from core.matcher import InvoiceMatcher
+from core.fatturapa_analyzer import FatturaPAAnalyzer
+from core.keyword_rules import classify_line_by_keyword
+from config.rules import (
+    TOLLERANZA_PERCENTUALE, TOLLERANZA_ASSOLUTA, TOLLERANZA_TOTALE_FATTURA,
+    TOLLERANZA_MATCH_IMPLICITO_PERCENT, TOLLERANZA_MATCH_IMPLICITO_ASSOLUTA,
+    TOLLERANZA_MATCH_IMPLICITO_LARGA_ASSOLUTA, TOLLERANZA_MATCH_IMPLICITO_LARGA_PERCENT,
+    MATCH_IMPLICITO_GUARDIA_DUPLICATI, MATCH_IMPLICITO_ATTIVO,
+    MATCH_PARZIALE_ATTIVO, MATCH_PARZIALE_MAX_RIGHE,
+    MATCH_PARZIALE_MAX_EXTRA_PERCENT, MATCH_PARZIALE_TOLLERANZA_ASSOLUTA,
+    SUGGERIMENTI_ATTIVI, SUGGERIMENTI_MAX_RIGHE,
+    SUGGERIMENTI_TOLLERANZA_ASSOLUTA, SUGGERIMENTI_MAX_AGE_MONTHS,
+    MAPPATURA_FORNITORI_FISSI, MAPPATURA_FORNITORI_FISSI_ATTIVA,
+)
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger('report_merci')
+
+# Classificazioni il cui OdA NON e' citato esplicitamente nell'XML ma viene
+# risolto dall'analyzer via match implicito / parziale. Per queste si usa
+# analysis.purchase_order (gli *_AMBIGUO hanno purchase_order=None -> esclusi).
+MATCH_RESOLVED_CLASSES = {
+    'MATCH_IMPLICITO',
+    'MATCH_PARZIALE_OK',
+    'PARZIALE_CUMULATIVO_OK',
+}
 
 
 # ============================================================
@@ -96,21 +124,32 @@ class InvoiceRecord:
 # QUERY
 # ============================================================
 
-def fetch_pending_attachments(client: OdooReadOnlyClient,
-                              lookback_days: int) -> List[Dict]:
-    """Fatturapa attachments non-registered di Ecotel, no autofatture, ultimi N gg."""
-    cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    return client._call(
-        'fatturapa.attachment.in', 'search_read',
-        [('registered', '=', False),
-         ('is_self_invoice', '=', False),
-         ('company_id', '=', 1),
-         ('create_date', '>=', cutoff)],
-        fields=['id', 'att_name', 'xml_supplier_id',
-                'invoices_total', 'invoices_date',
-                'create_date'],
-        order='create_date asc',
-        limit=5000,
+def build_analyzer(client: OdooReadOnlyClient) -> FatturaPAAnalyzer:
+    """Costruisce l'analyzer con gli STESSI parametri di Agent Invoices/app.py,
+    cosi' la risoluzione OdA (esplicito + match implicito + parziale) e' identica
+    a quella che produce le classificazioni mostrate in dashboard."""
+    matcher = InvoiceMatcher(
+        TOLLERANZA_PERCENTUALE, TOLLERANZA_ASSOLUTA,
+        TOLLERANZA_TOTALE_FATTURA, classify_line_by_keyword,
+    )
+    return FatturaPAAnalyzer(
+        client, matcher, TOLLERANZA_TOTALE_FATTURA,
+        implicit_match_enabled=MATCH_IMPLICITO_ATTIVO,
+        implicit_match_tolerance_percent=TOLLERANZA_MATCH_IMPLICITO_PERCENT,
+        implicit_match_tolerance_absolute=TOLLERANZA_MATCH_IMPLICITO_ASSOLUTA,
+        implicit_match_loose_tolerance_absolute=TOLLERANZA_MATCH_IMPLICITO_LARGA_ASSOLUTA,
+        implicit_match_loose_tolerance_percent=TOLLERANZA_MATCH_IMPLICITO_LARGA_PERCENT,
+        implicit_match_duplicate_guard=MATCH_IMPLICITO_GUARDIA_DUPLICATI,
+        partial_match_enabled=MATCH_PARZIALE_ATTIVO,
+        partial_match_max_rows=MATCH_PARZIALE_MAX_RIGHE,
+        partial_match_max_extra_percent=MATCH_PARZIALE_MAX_EXTRA_PERCENT,
+        partial_match_tolerance_absolute=MATCH_PARZIALE_TOLLERANZA_ASSOLUTA,
+        suggestions_enabled=SUGGERIMENTI_ATTIVI,
+        suggestions_max_lines=SUGGERIMENTI_MAX_RIGHE,
+        suggestions_tolerance_absolute=SUGGERIMENTI_TOLLERANZA_ASSOLUTA,
+        suggestions_max_age_months=SUGGERIMENTI_MAX_AGE_MONTHS,
+        supplier_mapping_enabled=MAPPATURA_FORNITORI_FISSI_ATTIVA,
+        supplier_mapping=MAPPATURA_FORNITORI_FISSI,
     )
 
 
@@ -187,38 +226,63 @@ def fetch_pickings(client: OdooReadOnlyClient,
 # ============================================================
 
 def analyze(client: OdooReadOnlyClient,
-            lookback_days: int) -> List[InvoiceRecord]:
-    """Cuore del report: identifica le fatture con merci NON ricevute."""
-    logger.info(f"Carico attachment non-registered ultimi {lookback_days} gg")
-    atts = fetch_pending_attachments(client, lookback_days)
+            lookback_days: int,
+            min_age_days: int) -> List[InvoiceRecord]:
+    """Cuore del report: identifica le fatture con merci NON ricevute.
+
+    Universo: fatturapa.attachment.in non-registered di Ecotel (no autofatture)
+    ricevute via SdI da ALMENO `min_age_days` giorni e non oltre `lookback_days`.
+    Gli OdA collegati sono quelli citati esplicitamente nell'XML PIU' quelli
+    risolti dall'analyzer via match implicito / parziale (MATCH_RESOLVED_CLASSES).
+    """
+    now = datetime.now()
+    date_from = (now - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+    date_to = (now - timedelta(days=min_age_days)).strftime('%Y-%m-%d')
+    logger.info(f"Carico attachment non-registered Ecotel ricevuti tra "
+                f"{date_from} e {date_to} (eta >= {min_age_days} gg, "
+                f"lookback {lookback_days} gg)")
+    atts = client.get_fatturapa_attachments(
+        only_unregistered=True, exclude_self_invoice=True,
+        company_id=1, date_from=date_from, date_to=date_to, limit=5000,
+    )
     logger.info(f"Trovati: {len(atts)} attachment")
 
-    invoices: List[InvoiceRecord] = []
-    referenced_oda_names: Set[str] = set()
-    att_to_parsed: Dict[int, object] = {}
-
-    # 1. Parse XML di tutti gli attachment + colleziono OdA citati
+    # 1. Analisi completa (stessa pipeline app.py): classifica e risolve OdA
+    analyzer = build_analyzer(client)
+    analyses = []
     for a in atts:
-        full = client._call('fatturapa.attachment.in', 'read', [a['id']],
-                          fields=['datas'])
-        if not full or not full[0].get('datas'):
-            continue
         try:
-            parsed = parse_from_base64(full[0]['datas'])
+            analyses.append(analyzer.analyze(a))
         except Exception as e:
-            logger.warning(f"parse error att {a['id']}: {e}")
+            logger.warning(f"analyze error att {a.get('id')}: {e}")
+    analyzer.apply_duplicate_guard(analyses)
+    analyzer.apply_strict_wins_over_loose(analyses)
+    analyzer.apply_run_cumulative_check(analyses)
+
+    # 2. OdA candidati per fattura: espliciti (XML) UNION risolti via
+    #    match implicito/parziale (analysis.purchase_order).
+    referenced_oda_names: Set[str] = set()
+    per_att_oda: Dict[int, Set[str]] = {}
+    for an in analyses:
+        xd = getattr(an, 'xml_data', None)
+        if not xd:
             continue
-        att_to_parsed[a['id']] = parsed
-        for oda in parsed.oda_riferimenti or []:
-            referenced_oda_names.add(oda.strip())
+        names = {n.strip() for n in (xd.oda_riferimenti or []) if n and n.strip()}
+        po = getattr(an, 'purchase_order', None)
+        if (an.classification in MATCH_RESOLVED_CLASSES
+                and isinstance(po, dict) and po.get('name')):
+            names.add(po['name'].strip())
+        if not names:
+            continue
+        per_att_oda[an.attachment_id] = names
+        referenced_oda_names |= names
 
-    logger.info(f"OdA distinti citati negli XML: {len(referenced_oda_names)}")
+    logger.info(f"OdA distinti da verificare (espliciti + impliciti/parziali): "
+                f"{len(referenced_oda_names)}")
 
-    # 2. Bulk fetch PO per name
+    # 3. Bulk fetch PO per name + POL (con product.type) + pickings
     po_by_name = fetch_po_by_names(client, referenced_oda_names)
     logger.info(f"OdA trovati su Odoo: {len(po_by_name)}")
-
-    # 3. Bulk fetch POL e Pickings necessari
     all_pol_ids: List[int] = []
     all_picking_ids: List[int] = []
     for po in po_by_name.values():
@@ -227,21 +291,17 @@ def analyze(client: OdooReadOnlyClient,
     pol_by_id = fetch_pol_with_product_type(client, all_pol_ids)
     picking_by_id = fetch_pickings(client, all_picking_ids)
 
-    # 4. Build InvoiceRecord per ogni attachment, applico filtro merci NON ricevute
-    for a in atts:
-        parsed = att_to_parsed.get(a['id'])
-        if not parsed:
+    # 4. Build InvoiceRecord, applico filtro merci NON ricevute
+    invoices: List[InvoiceRecord] = []
+    for an in analyses:
+        names = per_att_oda.get(getattr(an, 'attachment_id', None))
+        if not names:
             continue
-        oda_refs = parsed.oda_riferimenti or []
-        if not oda_refs:
-            # Skip: senza OdA esplicito non possiamo verificare picking
-            # (il match implicito/parziale lo fa il classifier; il report
-            # serale resta conservativo).
-            continue
+        xd = an.xml_data
 
         resolved_pos: List[PoData] = []
-        for oda_name in oda_refs:
-            po = po_by_name.get(oda_name.strip())
+        for oda_name in names:
+            po = po_by_name.get(oda_name)
             if not po:
                 continue
             pol_ids = po.get('order_line') or []
@@ -267,37 +327,31 @@ def analyze(client: OdooReadOnlyClient,
             merci_rows = [pr for pr in podata.pol_rows if pr.is_merce]
             if not merci_rows:
                 continue
-            unreceived = [pr for pr in merci_rows if pr.qty_received == 0]
-            if unreceived:
+            if any(pr.qty_received == 0 for pr in merci_rows):
                 keep = True
                 break
         if not keep:
             continue
 
-        # Cedente
-        ced_name = parsed.cedente_denominazione or ''
-        sup = a.get('xml_supplier_id')
-        if not ced_name and sup:
-            ced_name = sup[1]
-        # importo: parse > attachment cache
-        importo = parsed.importo_totale or (a.get('invoices_total') or 0)
-        # data ft: parse > attachment (formato DD/MM/YYYY -> normalizzo)
-        inv_date = parsed.data or ''
+        # Cedente / importo / data
+        ced_name = xd.cedente_denominazione or getattr(an, 'supplier_name', '') or ''
+        importo = float(xd.importo_totale or getattr(an, 'invoice_total', 0) or 0)
+        inv_date = xd.data or ''
         if not inv_date:
-            raw = a.get('invoices_date') or ''
+            raw = getattr(an, 'invoice_date', '') or ''
             if raw and '/' in raw:
                 parts = raw.split('/')
                 if len(parts) == 3:
                     inv_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
         invoices.append(InvoiceRecord(
-            attachment_id=a['id'],
-            invoice_number=parsed.numero or '',
+            attachment_id=an.attachment_id,
+            invoice_number=xd.numero or '',
             invoice_date=inv_date,
             cedente=ced_name,
-            cedente_vat=parsed.cedente_partita_iva or '',
-            importo_totale=float(importo),
-            create_date=(a.get('create_date') or '')[:19],
-            oda_refs=oda_refs,
+            cedente_vat=xd.cedente_partita_iva or '',
+            importo_totale=importo,
+            create_date=(getattr(an, 'attachment_create_date', '') or '')[:19],
+            oda_refs=sorted(names),
             oda_resolved=resolved_pos,
         ))
 
@@ -473,8 +527,9 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
     parts.append('<div class="footer">'
                  'Report generato automaticamente dall\'Agent Fatturazione '
                  'Passiva · invoice agent Ecotel · '
-                 'Solo fatture <b>registered=False</b> con almeno una riga '
-                 "merce su OdA citato esplicitamente nell'XML."
+                 'Solo fatture <b>registered=False</b> ricevute da almeno 7 '
+                 'giorni, con almeno una riga merce su OdA collegato (citato '
+                 "nell'XML oppure risolto via match implicito/parziale)."
                  '</div></body></html>')
     return ''.join(parts)
 
@@ -521,7 +576,11 @@ def send_mail(html: str, subject: str) -> None:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--lookback', type=int, default=90,
-                    help='giorni di lookback (default 90)')
+                    help='giorni di lookback massimo su create_date (default 90)')
+    ap.add_argument('--min-age', type=int, default=7,
+                    help='eta minima in giorni dalla ricezione SdI: segnala solo '
+                         'fatture ricevute da almeno N gg ancora senza ricezione '
+                         'merce (default 7)')
     ap.add_argument('--dry-run', action='store_true',
                     help='non invia mail, stampa solo')
     ap.add_argument('--output', type=str,
@@ -536,7 +595,7 @@ def main():
     )
     client.connect()
 
-    invoices = analyze(client, args.lookback)
+    invoices = analyze(client, args.lookback, args.min_age)
     logger.info(f"Fatture con merci non ricevute: {len(invoices)}")
 
     html = render_html(invoices, args.lookback)
