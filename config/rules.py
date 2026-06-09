@@ -687,6 +687,55 @@ MAPPATURA_FORNITORI_FISSI = {
         'journal_id': 2,
         'company_id': 1,
     },
+    # BLUE SGR S.P.A. — locazioni uffici Roma (2 immobili: IT0002, IT0011).
+    # OdA-ledger annuale P03543 (S03811), 4 POL libere/mese: coppia Canone +
+    # Acconto per ciascuna delle 2 proprietà. Routing: line_groups_by_month
+    # cerca [Canone|Acconto] + mese italiano; le coppie sono equivalenti
+    # (no disambiguation per proprietà). 2 fatture/mese (una per immobile),
+    # importi variabili — il writer sovrascrive price_unit al momento della bozza.
+    # Conti: Canone → 430110 (id 393), Acconto spese comuni → 430130 (id 395).
+    # Fuori scope: AL-119 (imposta registro IVA 0%) e AL-120 (adeguamento ISTAT)
+    # → registrazione manuale.
+    'IT10219881009': {
+        'nome': 'Blue Sgr Spa Fondo Alba',
+        'partner_id': 1445,
+        'oda_fisso': 'P03543',
+        'conto_contabile_id': 393,         # 430110 locazione uffici (fallback)
+        'taxes_id': [11],                  # IVA 22%
+        'journal_id': 2,
+        'company_id': 1,
+        'libere_criterio': 'standard_qty_inv_rec',
+        'line_groups_by_month': [
+            {'match': 'Canone',  'account_id': 393},  # 430110 locazione uffici
+            {'match': 'Acconto', 'account_id': 395},  # 430130 oneri accessori
+        ],
+        'description_strategy': 'keep_original',
+        'auto_write_enabled': True,
+    },
+    # SANTINA SPA — parcheggi "Terminal Park" (Roma). OdA-ledger ricorrente
+    # P04893 (commessa S03811) con righe placeholder price=1, identico schema
+    # NWG Energia: il fornitore NON cita l'OdA in XML, importi variabili
+    # (€10-24/fattura), 1 riga "Terminal Park ECOTEL ITALIA SRL." per fattura.
+    # Storico: 7 fatture gia' registrate su P04893 da apr/2026, conto 420840
+    # (pedaggi/parcheggi deducibili 70%, id 1124), IVA 22%. Cadevano in
+    # NO_ODA_DA_CLASSIFICARE perche' non mappato. description_strategy
+    # pass_through: usa la desc XML + data (distingue le righe nel ledger).
+    # NB capienza: 6 righe libere su P04893 -> chiedere refill ad Acquisti
+    # quando si esauriscono (~6 fatture).
+    'IT00883111007': {
+        'nome': 'SANTINA SPA',
+        'oda_fisso': 'P04893',
+        'conto_contabile': '420840',
+        'conto_descrizione': 'pedaggi/parcheggi deducibili al 70%',
+        'partner_id': 76253,
+        'conto_contabile_id': 1124,
+        'taxes_id': [11],                  # IVA 22%
+        'journal_id': 2,
+        'company_id': 1,
+        'libere_criterio': 'standard_qty_inv_rec',
+        'description_strategy': 'pass_through',
+        'auto_write_enabled': True,
+    },
 }
 
 # Abilita/disabilita mappatura fornitori fissi

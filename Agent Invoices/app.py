@@ -211,6 +211,11 @@ def init_db():
         ("pdf_split_furgoni", "REAL"),
         ("pdf_split_promiscuo", "REAL"),
         ("pdf_split_warnings", "TEXT"),
+        # Stato ricezione merci (snapshot della run): 'SI' = tutte le righe
+        # merce (product/consu) dell'OdA risolto sono ricevute completamente;
+        # 'NO' = almeno una riga merce non ancora (del tutto) ricevuta;
+        # NULL = nessun OdA risolto o nessuna riga merce (servizi/no-OdA).
+        ("ricezione_merci", "TEXT"),
     ):
         try:
             c.execute(f"ALTER TABLE analyses ADD COLUMN {col} {ddl}")
@@ -338,9 +343,11 @@ def run_agent_async(limit=None):
         log_queue.put(("info", "Applicazione guardia cumulativa di run..."))
         analyzer.apply_run_cumulative_check(analyses)
 
-        # Salvo tutte le analisi nel DB (dopo guardie)
+        # Salvo tutte le analisi nel DB (dopo guardie). Passo il client per
+        # calcolare lo stato ricezione merci (snapshot) dalle po_lines.
+        _PRODUCT_TYPE_CACHE.clear()
         for a in analyses:
-            _save_analysis(c, run_id, a)
+            _save_analysis(c, run_id, a, client=client)
         conn.commit()
 
         # Statistiche finali
@@ -397,11 +404,66 @@ def run_agent_async(limit=None):
         is_running = False
 
 
-def _save_analysis(cursor, run_id, a):
+# Cache di run product_id -> product.type (popolata lazy in _calc_ricezione_merci).
+# Evita query ripetute: gli stessi prodotti ricorrono su molte righe/fatture.
+_PRODUCT_TYPE_CACHE = {}
+
+
+def _calc_ricezione_merci(client, a):
+    """Stato ricezione merci per la fattura (snapshot della run).
+
+    Ritorna 'SI' se TUTTE le righe MERCE (product.type in product/consu)
+    dell'OdA risolto sono ricevute completamente (qty_received >= product_qty);
+    'NO' se almeno una riga merce non lo è; None se non c'è OdA risolto o
+    l'OdA non ha righe merce (es. soli servizi) → la UI mostrerà un trattino.
+    """
+    po_lines = getattr(a, 'po_lines', None)
+    # Fallback: l'OdA è risolto ma le righe non sono state pre-caricate in
+    # questo ramo del classifier → le carico al volo dall'order_line.
+    if not po_lines and getattr(a, 'purchase_order', None):
+        try:
+            order_line = a.purchase_order.get('order_line') or []
+            if order_line:
+                po_lines = client.get_purchase_order_lines(order_line)
+        except Exception:
+            po_lines = None
+    if not po_lines:
+        return None
+
+    # product.type per le righe (bulk sui mancanti in cache)
+    prod_ids = [pl['product_id'][0] for pl in po_lines
+                if pl.get('product_id') and isinstance(pl['product_id'], list)]
+    missing = [pid for pid in set(prod_ids) if pid not in _PRODUCT_TYPE_CACHE]
+    if missing:
+        try:
+            for r in client._call('product.product', 'read', missing, fields=['type']):
+                _PRODUCT_TYPE_CACHE[r['id']] = r.get('type', '')
+        except Exception:
+            return None  # in caso di errore Odoo non blocco il salvataggio
+
+    merce_rows = []
+    for pl in po_lines:
+        pid = pl['product_id'][0] if (pl.get('product_id') and isinstance(pl['product_id'], list)) else None
+        if pid is not None and _PRODUCT_TYPE_CACHE.get(pid) in ('product', 'consu'):
+            merce_rows.append(pl)
+
+    if not merce_rows:
+        return None  # nessuna merce fisica (servizi) → N/A
+
+    for pl in merce_rows:
+        qty = pl.get('product_qty') or 0
+        rec = pl.get('qty_received') or 0
+        if qty > 0 and rec < qty:
+            return 'NO'  # almeno una riga merce non ancora ricevuta del tutto
+    return 'SI'
+
+
+def _save_analysis(cursor, run_id, a, client=None):
     """Salva una singola analisi nel DB."""
     po_name = a.purchase_order.get('name', '') if a.purchase_order else ''
     tipo_doc = getattr(a, 'xml_data', None)
     tipo_doc = tipo_doc.tipo_documento if tipo_doc else None
+    ricezione_merci = _calc_ricezione_merci(client, a) if client else None
     cursor.execute("""
         INSERT INTO analyses (
             run_id, attachment_id, attachment_name, supplier_name, supplier_vat,
@@ -409,8 +471,8 @@ def _save_analysis(cursor, run_id, a):
             oda_xml, oda_odoo, classification,
             total_diff, total_diff_percent,
             cumulative_others, cumulative_count,
-            commesse, actions, warnings, tipo_documento
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            commesse, actions, warnings, tipo_documento, ricezione_merci
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         run_id, a.attachment_id, a.attachment_name, a.supplier_name, a.supplier_vat,
         a.invoice_number, a.invoice_date, a.invoice_total,
@@ -420,7 +482,7 @@ def _save_analysis(cursor, run_id, a):
         ', '.join(a.commesse_detected),
         ' | '.join(a.actions_suggested),
         ' | '.join(a.warnings),
-        tipo_doc,
+        tipo_doc, ricezione_merci,
     ))
 
 
@@ -498,7 +560,7 @@ def invoices(run_id=None):
             run_id = last['id']
     if not run_id:
         conn.close()
-        return render_template('invoices.html', invoices=[], run_id=None, filters={})
+        return render_template('invoices.html', invoices=[], run_id=None, filters={}, detail_qs='')
 
     # Filtri dalla query string
     classification = request.args.get('class', '')
@@ -538,10 +600,19 @@ def invoices(run_id=None):
     ).fetchall()
 
     conn.close()
+    # Querystring filtri da propagare ai link "Dettaglio →" così la
+    # navigazione avanti/indietro nella pagina di dettaglio resta coerente
+    # con la lista filtrata.
+    from urllib.parse import urlencode
+    fqs = {k: v for k, v in (('class', classification),
+                             ('supplier', supplier),
+                             ('min_amount', min_amount)) if v}
+    detail_qs = ('?' + urlencode(fqs)) if fqs else ''
     return render_template('invoices.html',
                            invoices=analyses,
                            run_id=run_id,
                            classifications=[r['classification'] for r in cats],
+                           detail_qs=detail_qs,
                            filters={
                                'class': classification,
                                'supplier': supplier,
@@ -554,9 +625,61 @@ def invoice_detail(analysis_id):
     """Dettaglio singola fattura."""
     conn = get_db()
     a = conn.execute("SELECT * FROM analyses WHERE id=?", (analysis_id,)).fetchone()
-    conn.close()
     if not a:
+        conn.close()
         abort(404)
+
+    # Navigazione avanti/indietro: scorre le fatture della STESSA run
+    # rispettando gli stessi filtri (class/supplier/min_amount) e lo stesso
+    # ordinamento della lista /invoices, così i tasti ←/→ restano coerenti
+    # con la vista filtrata da cui l'utente arriva. Senza filtri scorre
+    # tutta la run.
+    classification = request.args.get('class', '')
+    supplier = request.args.get('supplier', '').strip()
+    min_amount = request.args.get('min_amount', '')
+
+    nav_query = "SELECT id FROM analyses WHERE run_id=?"
+    nav_params = [a['run_id']]
+    if classification:
+        cls_list = [c.strip() for c in classification.split(',') if c.strip()]
+        if len(cls_list) == 1:
+            nav_query += " AND classification=?"
+            nav_params.append(cls_list[0])
+        elif len(cls_list) > 1:
+            placeholders = ','.join('?' * len(cls_list))
+            nav_query += f" AND classification IN ({placeholders})"
+            nav_params.extend(cls_list)
+    if supplier:
+        nav_query += " AND supplier_name LIKE ?"
+        nav_params.append(f"%{supplier}%")
+    if min_amount:
+        try:
+            nav_query += " AND invoice_total >= ?"
+            nav_params.append(float(min_amount))
+        except ValueError:
+            pass
+    # Stesso ORDER BY della lista + tiebreaker id per ordine deterministico
+    nav_query += " ORDER BY invoice_total DESC, id ASC"
+    nav_ids = [r['id'] for r in conn.execute(nav_query, nav_params).fetchall()]
+    conn.close()
+
+    prev_id = next_id = nav_pos = nav_total = None
+    if analysis_id in nav_ids:
+        idx = nav_ids.index(analysis_id)
+        nav_pos = idx + 1
+        nav_total = len(nav_ids)
+        if idx > 0:
+            prev_id = nav_ids[idx - 1]
+        if idx < len(nav_ids) - 1:
+            next_id = nav_ids[idx + 1]
+
+    # Querystring per preservare i filtri nei link prev/next
+    from urllib.parse import urlencode
+    nav_qs = {k: v for k, v in (('class', classification),
+                                ('supplier', supplier),
+                                ('min_amount', min_amount)) if v}
+    nav_suffix = ('?' + urlencode(nav_qs)) if nav_qs else ''
+
     # Flag factoring: il fornitore (SARDA/MBFACTA) usa il writer dedicato
     # create_bozza_factoring (box dedicato), NON il pulsante standard
     # MAPPATURA_FORNITORE_FISSO (che cercherebbe righe libere inesistenti).
@@ -570,7 +693,10 @@ def invoice_detail(analysis_id):
         is_factoring = bool(me and me.get('factoring'))
     except Exception:
         is_factoring = False
-    return render_template('invoice_detail.html', a=a, is_factoring=is_factoring)
+    return render_template('invoice_detail.html', a=a, is_factoring=is_factoring,
+                           prev_id=prev_id, next_id=next_id,
+                           nav_pos=nav_pos, nav_total=nav_total,
+                           nav_suffix=nav_suffix)
 
 
 @app.route('/history')

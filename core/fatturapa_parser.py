@@ -270,14 +270,18 @@ def _extract_oda_from_text(text: str) -> List[str]:
     return found
 
 
-def parse_fatturapa_xml(xml_content: str) -> FatturaPAData:
+def parse_fatturapa_xml(xml_content) -> FatturaPAData:
     """
     Parsa un XML FatturaPA e ritorna la struttura dati.
-    xml_content: stringa XML (non base64).
+    xml_content: stringa XML o bytes (non base64).
     """
     data = FatturaPAData()
 
     try:
+        # Normalizza a str: accetta sia str che bytes
+        if isinstance(xml_content, bytes):
+            xml_content = xml_content.decode('utf-8', errors='replace')
+
         # Rimuovo BOM se presente
         if xml_content.startswith('\ufeff'):
             xml_content = xml_content[1:]

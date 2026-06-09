@@ -202,6 +202,7 @@
           <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Data</th>
           <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Importo</th>
           <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">OdA</th>
+          <th class="text-center px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Ricezione merci</th>
           <th class="text-left px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Categoria</th>
           <th class="text-right px-3 py-2 text-xs font-semibold text-gray-600 uppercase">Diff</th>
           <th class="text-center px-3 py-2 text-xs font-semibold text-gray-600 uppercase"></th>
@@ -223,6 +224,16 @@
             {% elif inv['oda_xml'] %}
               <span class="font-mono text-gray-400">{{ inv['oda_xml'] }}</span>
             {% else %}-{% endif %}
+          </td>
+          <td class="px-3 py-2 text-center">
+            {% set rm = inv['ricezione_merci'] %}
+            {% if rm == 'SI' %}
+              <span class="badge badge-green">SÌ</span>
+            {% elif rm == 'NO' %}
+              <span class="badge badge-red">NO</span>
+            {% else %}
+              <span class="text-gray-300">—</span>
+            {% endif %}
           </td>
           <td class="px-3 py-2">
             {% set cls = inv['classification'] %}
@@ -271,12 +282,12 @@
             {% else %}-{% endif %}
           </td>
           <td class="px-3 py-2 text-center">
-            <a href="/invoice/{{ inv['id'] }}" class="text-odoo-600 hover:text-odoo-800 text-xs">Dettaglio →</a>
+            <a href="/invoice/{{ inv['id'] }}{{ detail_qs }}" class="text-odoo-600 hover:text-odoo-800 text-xs">Dettaglio →</a>
           </td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="8" class="text-center py-8 text-gray-400">Nessuna fattura trovata</td>
+          <td colspan="9" class="text-center py-8 text-gray-400">Nessuna fattura trovata</td>
         </tr>
         {% endfor %}
       </tbody>

@@ -1358,6 +1358,7 @@ class OdooWriter:
                     'move_amount': -amount if is_nota_credito else amount,
                     'description': description,
                     'taxes_id': list(pl_taxes),
+                    'account_id': group_cfg.get('account_id'),  # per-gruppo (es. BLUE SGR: Canone vs Acconto)
                     'old_price': po_line.get('price_unit', 0),
                     'old_name': base_desc,
                     'old_date_planned': po_line.get('date_planned'),
@@ -1524,7 +1525,7 @@ class OdooWriter:
                     # Odoo con in_refund calcola PO.qty_invoiced = +1 (positivo).
                     'quantity': -1 if is_nota_credito else 1,
                     'price_unit': a['move_amount'],
-                    'account_id': mapping_entry['conto_contabile_id'],
+                    'account_id': a.get('account_id') or mapping_entry['conto_contabile_id'],
                     'tax_ids': [(6, 0, a['taxes_id'])],
                     'purchase_line_id': a['po_line_id'],
                 }
